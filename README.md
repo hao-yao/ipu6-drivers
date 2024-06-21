@@ -55,8 +55,9 @@ Three ways are available:
 - Enable the following settings in .config
 	```conf
 	CONFIG_VIDEO_INTEL_IPU6=m
-	CONFIG_IPU_ISYS_BRIDGE=y
-	# For kernel >= v6.8 please use IPU_BRIDGE instead of IPU_ISYS_BRIDGE
+	# IPU_ISYS_BRIDGE for kernel < v6.6 only
+	# CONFIG_IPU_ISYS_BRIDGE=y
+	CONFIG_IPU_ISYS_BRIDGE=n
 	CONFIG_IPU_BRIDGE=m
 	CONFIG_VIDEO_OV01A1S=m
 	CONFIG_VIDEO_OV01A10=m
