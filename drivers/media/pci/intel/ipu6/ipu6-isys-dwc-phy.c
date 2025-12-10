@@ -1,39 +1,30 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (C) 2013 - 2024 Intel Corporation
+ * Copyright (C) 2013--2024 Intel Corporation
  */
 
+#include <linux/bitfield.h>
+#include <linux/bits.h>
 #include <linux/delay.h>
+#include <linux/device.h>
 #include <linux/iopoll.h>
-#include <media/ipu-isys.h>
-#include <media/v4l2-device.h>
-#include "ipu.h"
-#include "ipu-buttress.h"
-#include "ipu-isys.h"
-#include "ipu-isys-csi2.h"
-#include "ipu-platform-regs.h"
-#include "ipu-platform-isys-csi2-reg.h"
-#include "ipu6-isys-csi2.h"
-#include "ipu6-isys-dwc-phy.h"
+#include <linux/math64.h>
 
-#define IPU_DWC_DPHY_MAX_NUM			(6)
-#define IPU_DWC_DPHY_BASE(i)			(0x238038 + 0x34 * (i))
-#define IPU_DWC_DPHY_RSTZ			(0x00)
-#define IPU_DWC_DPHY_SHUTDOWNZ			(0x04)
-#define IPU_DWC_DPHY_HSFREQRANGE		(0x08)
-#define IPU_DWC_DPHY_CFGCLKFREQRANGE		(0x0c)
-#define IPU_DWC_DPHY_TEST_IFC_ACCESS_MODE	(0x10)
-#define IPU_DWC_DPHY_TEST_IFC_REQ		(0x14)
-#define IPU_DWC_DPHY_TEST_IFC_REQ_COMPLETION	(0x18)
-#define IPU_DWC_DPHY_TEST_IFC_CTRL0		(0x1c)
-#define IPU_DWC_DPHY_TEST_IFC_CTRL1		(0x20)
-#define IPU_DWC_DPHY_TEST_IFC_CTRL1_RO		(0x24)
-#define IPU_DWC_DPHY_DFT_CTRL0			(0x28)
-#define IPU_DWC_DPHY_DFT_CTRL1			(0x2c)
-#define IPU_DWC_DPHY_DFT_CTRL2			(0x30)
+#include "ipu6-bus.h"
+#include "ipu6-isys.h"
+#include "ipu6-platform-isys-csi2-reg.h"
 
-#define PPI_DATAWIDTH_8BIT		0
-#define PPI_DATAWIDTH_16BIT		1
+#define IPU6_DWC_DPHY_BASE(i)			(0x238038 + 0x34 * (i))
+#define IPU6_DWC_DPHY_RSTZ			0x00
+#define IPU6_DWC_DPHY_SHUTDOWNZ			0x04
+#define IPU6_DWC_DPHY_HSFREQRANGE		0x08
+#define IPU6_DWC_DPHY_CFGCLKFREQRANGE		0x0c
+#define IPU6_DWC_DPHY_TEST_IFC_ACCESS_MODE	0x10
+#define IPU6_DWC_DPHY_TEST_IFC_REQ		0x14
+#define IPU6_DWC_DPHY_TEST_IFC_REQ_COMPLETION	0x18
+#define IPU6_DWC_DPHY_DFT_CTRL0			0x28
+#define IPU6_DWC_DPHY_DFT_CTRL1			0x2c
+#define IPU6_DWC_DPHY_DFT_CTRL2			0x30
 
 /*
  * test IFC request definition:
@@ -43,19 +34,16 @@
  * --24----16------4-----0
  * --|-data-|-addr-|-req-|
  */
-#define IFC_REQ(req, addr, data) ((data) << 16 | (addr) << 4 | (req))
+#define IFC_REQ(req, addr, data) (FIELD_PREP(GENMASK(23, 16), data) | \
+				  FIELD_PREP(GENMASK(15, 4), addr) | \
+				  FIELD_PREP(GENMASK(1, 0), req))
 
-enum req_type {
-	TEST_IFC_REQ_READ = 0,
-	TEST_IFC_REQ_WRITE = 1,
-	TEST_IFC_REQ_RESET = 2,
-};
+#define TEST_IFC_REQ_READ	0
+#define TEST_IFC_REQ_WRITE	1
+#define TEST_IFC_REQ_RESET	2
 
-enum access_mode {
-	TEST_IFC_ACCESS_MODE_FSM = 0,
-	/* backup mode for DFT/workaround etc */
-	TEST_IFC_ACCESS_MODE_IFC_CTL = 1,
-};
+#define TEST_IFC_ACCESS_MODE_FSM	0
+#define TEST_IFC_ACCESS_MODE_IFC_CTL	1
 
 enum phy_fsm_state {
 	PHY_FSM_STATE_POWERON = 0,
@@ -72,31 +60,33 @@ enum phy_fsm_state {
 	PHY_FSM_STATE_INVALID,
 };
 
-static void dwc_dphy_write(struct ipu_isys *isys, u32 phy_id, u32 addr,
+static void dwc_dphy_write(struct ipu6_isys *isys, u32 phy_id, u32 addr,
 			   u32 data)
 {
+	struct device *dev = &isys->adev->auxdev.dev;
 	void __iomem *isys_base = isys->pdata->base;
-	void __iomem *base = isys_base + IPU_DWC_DPHY_BASE(phy_id);
+	void __iomem *base = isys_base + IPU6_DWC_DPHY_BASE(phy_id);
 
-	dev_dbg(&isys->adev->dev, "write: reg 0x%lx = data 0x%x",
-		base + addr - isys_base, data);
+	dev_dbg(dev, "write: reg 0x%lx = data 0x%x", base + addr - isys_base,
+		data);
 	writel(data, base + addr);
 }
 
-static u32 dwc_dphy_read(struct ipu_isys *isys, u32 phy_id, u32 addr)
+static u32 dwc_dphy_read(struct ipu6_isys *isys, u32 phy_id, u32 addr)
 {
-	u32 data;
+	struct device *dev = &isys->adev->auxdev.dev;
 	void __iomem *isys_base = isys->pdata->base;
-	void __iomem *base = isys_base + IPU_DWC_DPHY_BASE(phy_id);
+	void __iomem *base = isys_base + IPU6_DWC_DPHY_BASE(phy_id);
+	u32 data;
 
 	data = readl(base + addr);
-	dev_dbg(&isys->adev->dev, "read: reg 0x%lx = data 0x%x",
-		base + addr - isys_base, data);
+	dev_dbg(dev, "read: reg 0x%lx = data 0x%x", base + addr - isys_base,
+		data);
 
 	return data;
 }
 
-static void dwc_dphy_write_mask(struct ipu_isys *isys, u32 phy_id, u32 addr,
+static void dwc_dphy_write_mask(struct ipu6_isys *isys, u32 phy_id, u32 addr,
 				u32 data, u8 shift, u8 width)
 {
 	u32 temp;
@@ -109,159 +99,128 @@ static void dwc_dphy_write_mask(struct ipu_isys *isys, u32 phy_id, u32 addr,
 	dwc_dphy_write(isys, phy_id, addr, temp);
 }
 
-static u32 __maybe_unused dwc_dphy_read_mask(struct ipu_isys *isys, u32 phy_id,
+static u32 __maybe_unused dwc_dphy_read_mask(struct ipu6_isys *isys, u32 phy_id,
 					     u32 addr, u8 shift,  u8 width)
 {
-	return (dwc_dphy_read(isys, phy_id, addr) >> shift) & ((1 << width) - 1);
+	u32 val;
+
+	val = dwc_dphy_read(isys, phy_id, addr) >> shift;
+	return val & ((1 << width) - 1);
 }
 
-#define DWC_DPHY_TIMEOUT (5000000)
-static int dwc_dphy_ifc_read(struct ipu_isys *isys, u32 phy_id, u32 addr, u32 *val)
+#define DWC_DPHY_TIMEOUT (5 * USEC_PER_SEC)
+static int dwc_dphy_ifc_read(struct ipu6_isys *isys, u32 phy_id, u32 addr,
+			     u32 *val)
 {
-	int rval;
-	u32 completion;
+	struct device *dev = &isys->adev->auxdev.dev;
 	void __iomem *isys_base = isys->pdata->base;
-	void __iomem *base = isys_base + IPU_DWC_DPHY_BASE(phy_id);
+	void __iomem *base = isys_base + IPU6_DWC_DPHY_BASE(phy_id);
 	void __iomem *reg;
-	u32 timeout = DWC_DPHY_TIMEOUT;
+	u32 completion;
+	int ret;
 
-	dwc_dphy_write(isys, phy_id, IPU_DWC_DPHY_TEST_IFC_REQ,
+	dwc_dphy_write(isys, phy_id, IPU6_DWC_DPHY_TEST_IFC_REQ,
 		       IFC_REQ(TEST_IFC_REQ_READ, addr, 0));
-	reg = base + IPU_DWC_DPHY_TEST_IFC_REQ_COMPLETION;
-	rval = readl_poll_timeout(reg, completion, !(completion & BIT(0)),
-				  10, timeout);
-	if (rval) {
-		dev_err(&isys->adev->dev,
-			"%s: ifc request read timeout!", __func__);
-		return rval;
+	reg = base + IPU6_DWC_DPHY_TEST_IFC_REQ_COMPLETION;
+	ret = readl_poll_timeout(reg, completion, !(completion & BIT(0)),
+				 10, DWC_DPHY_TIMEOUT);
+	if (ret) {
+		dev_err(dev, "DWC ifc request read timeout\n");
+		return ret;
 	}
 
 	*val = completion >> 8 & 0xff;
-	dev_dbg(&isys->adev->dev, "ifc read 0x%x = 0x%x", addr, *val);
+	*val = FIELD_GET(GENMASK(15, 8), completion);
+	dev_dbg(dev, "DWC ifc read 0x%x = 0x%x", addr, *val);
 
 	return 0;
 }
 
-static int dwc_dphy_ifc_write(struct ipu_isys *isys, u32 phy_id, u32 addr, u32 data)
+static int dwc_dphy_ifc_write(struct ipu6_isys *isys, u32 phy_id, u32 addr,
+			      u32 data)
 {
-	int rval;
-	u32 completion;
-	void __iomem *reg;
+	struct device *dev = &isys->adev->auxdev.dev;
 	void __iomem *isys_base = isys->pdata->base;
-	void __iomem *base = isys_base + IPU_DWC_DPHY_BASE(phy_id);
-	u32 timeout = DWC_DPHY_TIMEOUT;
+	void __iomem *base = isys_base + IPU6_DWC_DPHY_BASE(phy_id);
+	void __iomem *reg;
+	u32 completion;
+	int ret;
 
-	dwc_dphy_write(isys, phy_id, IPU_DWC_DPHY_TEST_IFC_REQ,
+	dwc_dphy_write(isys, phy_id, IPU6_DWC_DPHY_TEST_IFC_REQ,
 		       IFC_REQ(TEST_IFC_REQ_WRITE, addr, data));
-	completion = readl(base + IPU_DWC_DPHY_TEST_IFC_REQ_COMPLETION);
-	reg = base + IPU_DWC_DPHY_TEST_IFC_REQ_COMPLETION;
-	rval = readl_poll_timeout(reg, completion, !(completion & BIT(0)),
-				  10, timeout);
-	if (rval) {
-		dev_err(&isys->adev->dev,
-			"%s: ifc request write timeout", __func__);
-		return rval;
-	}
+	completion = readl(base + IPU6_DWC_DPHY_TEST_IFC_REQ_COMPLETION);
+	reg = base + IPU6_DWC_DPHY_TEST_IFC_REQ_COMPLETION;
+	ret = readl_poll_timeout(reg, completion, !(completion & BIT(0)),
+				 10, DWC_DPHY_TIMEOUT);
+	if (ret)
+		dev_err(dev, "DWC ifc request write timeout\n");
 
-	return 0;
+	return ret;
 }
 
-static void dwc_dphy_ifc_write_mask(struct ipu_isys *isys, u32 phy_id, u32 addr,
-				    u32 data, u8 shift, u8 width)
+static void dwc_dphy_ifc_write_mask(struct ipu6_isys *isys, u32 phy_id,
+				    u32 addr, u32 data, u8 shift, u8 width)
 {
-	int rval;
 	u32 temp, mask;
+	int ret;
 
-	rval = dwc_dphy_ifc_read(isys, phy_id, addr, &temp);
-	if (rval) {
-		dev_err(&isys->adev->dev,
-			"dphy proxy read failed with %d", rval);
+	ret = dwc_dphy_ifc_read(isys, phy_id, addr, &temp);
+	if (ret)
 		return;
-	}
 
 	mask = (1 << width) - 1;
 	temp &= ~(mask << shift);
 	temp |= (data & mask) << shift;
-	rval = dwc_dphy_ifc_write(isys, phy_id, addr, temp);
-	if (rval)
-		dev_err(&isys->adev->dev, "dphy proxy write failed(%d)", rval);
+	dwc_dphy_ifc_write(isys, phy_id, addr, temp);
 }
 
-static u32 dwc_dphy_ifc_read_mask(struct ipu_isys *isys, u32 phy_id, u32 addr,
+static u32 dwc_dphy_ifc_read_mask(struct ipu6_isys *isys, u32 phy_id, u32 addr,
 				  u8 shift, u8 width)
 {
-	int rval;
+	int ret;
 	u32 val;
 
-	rval = dwc_dphy_ifc_read(isys, phy_id, addr, &val);
-	if (rval) {
-		dev_err(&isys->adev->dev, "dphy proxy read failed with %d", rval);
+	ret = dwc_dphy_ifc_read(isys, phy_id, addr, &val);
+	if (ret)
 		return 0;
-	}
 
 	return ((val >> shift) & ((1 << width) - 1));
 }
 
-static int dwc_dphy_pwr_up(struct ipu_isys *isys, u32 phy_id)
+static int dwc_dphy_pwr_up(struct ipu6_isys *isys, u32 phy_id)
 {
+	struct device *dev = &isys->adev->auxdev.dev;
 	u32 fsm_state;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0)
-	ktime_t __timeout = ktime_add_us(ktime_get(), DWC_DPHY_TIMEOUT);
-#else
 	int ret;
-	u32 timeout = DWC_DPHY_TIMEOUT;
-#endif
 
-	dwc_dphy_write(isys, phy_id, IPU_DWC_DPHY_RSTZ, 1);
+	dwc_dphy_write(isys, phy_id, IPU6_DWC_DPHY_RSTZ, 1);
 	usleep_range(10, 20);
-	dwc_dphy_write(isys, phy_id, IPU_DWC_DPHY_SHUTDOWNZ, 1);
+	dwc_dphy_write(isys, phy_id, IPU6_DWC_DPHY_SHUTDOWNZ, 1);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0)
-	for (;;) {
-		fsm_state = dwc_dphy_ifc_read_mask(isys, phy_id, 0x1e, 0, 4);
-		if (fsm_state == PHY_FSM_STATE_IDLE ||
-		    fsm_state == PHY_FSM_STATE_ULP)
-			break;
-		if (ktime_compare(ktime_get(), __timeout) > 0) {
-			fsm_state = dwc_dphy_ifc_read_mask(isys, phy_id,
-							   0x1e, 0, 4);
-			break;
-		}
-		usleep_range(50, 100);
-	}
-
-	if (fsm_state != PHY_FSM_STATE_IDLE && fsm_state != PHY_FSM_STATE_ULP) {
-		dev_err(&isys->adev->dev, "DPHY%d power up failed, state 0x%x",
-			phy_id, fsm_state);
-		return -ETIMEDOUT;
-	}
-#else
 	ret = read_poll_timeout(dwc_dphy_ifc_read_mask, fsm_state,
 				(fsm_state == PHY_FSM_STATE_IDLE ||
-				 fsm_state == PHY_FSM_STATE_ULP), 100, timeout,
-				false, isys, phy_id, 0x1e, 0, 4);
+				 fsm_state == PHY_FSM_STATE_ULP),
+				100, DWC_DPHY_TIMEOUT, false, isys,
+				phy_id, 0x1e, 0, 4);
 
-	if (ret) {
-		dev_err(&isys->adev->dev, "DPHY%d power up failed, state 0x%x",
-			phy_id, fsm_state);
-		return ret;
-	}
-#endif
+	if (ret)
+		dev_err(dev, "Dphy %d power up failed, state 0x%x", phy_id,
+			fsm_state);
 
-	return 0;
+	return ret;
 }
 
 struct dwc_dphy_freq_range {
 	u8 hsfreq;
-	u32 min;
-	u32 max;
-	u32 default_mbps;
-	u32 osc_freq_target;
+	u16 min;
+	u16 max;
+	u16 default_mbps;
+	u16 osc_freq_target;
 };
 
 #define DPHY_FREQ_RANGE_NUM		(63)
 #define DPHY_FREQ_RANGE_INVALID_INDEX	(0xff)
-const struct dwc_dphy_freq_range freqranges[DPHY_FREQ_RANGE_NUM] = {
+static const struct dwc_dphy_freq_range freqranges[DPHY_FREQ_RANGE_NUM] = {
 	{0x00,	80,	97,	80,	335},
 	{0x10,	80,	107,	90,	335},
 	{0x20,	84,	118,	100,	335},
@@ -324,14 +283,14 @@ const struct dwc_dphy_freq_range freqranges[DPHY_FREQ_RANGE_NUM] = {
 	{0x46,	2221,	2480,	2350,	315},
 	{0x47,	2269,	2500,	2400,	321},
 	{0x48,	2316,	2500,	2450,	328},
-	{0x49,	2364,	2500,	2500,	335},
+	{0x49,	2364,	2500,	2500,	335}
 };
 
-static u32 get_hsfreq_by_mbps(u32 mbps)
+static u16 get_hsfreq_by_mbps(u32 mbps)
 {
-	int i;
+	unsigned int i = DPHY_FREQ_RANGE_NUM;
 
-	for (i = DPHY_FREQ_RANGE_NUM - 1; i >= 0; i--) {
+	while (i--) {
 		if (freqranges[i].default_mbps == mbps ||
 		    (mbps >= freqranges[i].min && mbps <= freqranges[i].max))
 			return i;
@@ -340,24 +299,25 @@ static u32 get_hsfreq_by_mbps(u32 mbps)
 	return DPHY_FREQ_RANGE_INVALID_INDEX;
 }
 
-int ipu6_isys_dwc_phy_config(struct ipu_isys *isys, u32 phy_id, u32 mbps)
+static int ipu6_isys_dwc_phy_config(struct ipu6_isys *isys,
+				    u32 phy_id, u32 mbps)
 {
-	u32 index;
-	u32 osc_freq_target;
+	struct ipu6_bus_device *adev = isys->adev;
+	struct device *dev = &adev->auxdev.dev;
+	struct ipu6_device *isp = adev->isp;
 	u32 cfg_clk_freqrange;
-	struct ipu_bus_device *adev = to_ipu_bus_device(&isys->adev->dev);
-	struct ipu_device *isp = adev->isp;
+	u32 osc_freq_target;
+	u32 index;
 
-	dev_dbg(&isys->adev->dev, "config phy %u with %u mbps", phy_id, mbps);
+	dev_dbg(dev, "config Dphy %u with %u mbps", phy_id, mbps);
 
 	index = get_hsfreq_by_mbps(mbps);
 	if (index == DPHY_FREQ_RANGE_INVALID_INDEX) {
-		dev_err(&isys->adev->dev, "link freq not found for mbps %u",
-			mbps);
+		dev_err(dev, "link freq not found for mbps %u", mbps);
 		return -EINVAL;
 	}
 
-	dwc_dphy_write_mask(isys, phy_id, IPU_DWC_DPHY_HSFREQRANGE,
+	dwc_dphy_write_mask(isys, phy_id, IPU6_DWC_DPHY_HSFREQRANGE,
 			    freqranges[index].hsfreq, 0, 7);
 
 	/* Force termination Calibration */
@@ -394,24 +354,19 @@ int ipu6_isys_dwc_phy_config(struct ipu_isys *isys, u32 phy_id, u32 mbps)
 	 * (38.4 - 17) * 4 = ~85 (0x55)
 	 */
 	cfg_clk_freqrange = (isp->buttress.ref_clk - 170) * 4 / 10;
-	dev_dbg(&isys->adev->dev, "ref_clk = %u clf_freqrange = %u",
+	dev_dbg(dev, "ref_clk = %u clk_freqrange = %u",
 		isp->buttress.ref_clk, cfg_clk_freqrange);
-	dwc_dphy_write_mask(isys, phy_id, IPU_DWC_DPHY_CFGCLKFREQRANGE,
+	dwc_dphy_write_mask(isys, phy_id, IPU6_DWC_DPHY_CFGCLKFREQRANGE,
 			    cfg_clk_freqrange, 0, 8);
 
-	/*
-	 * run without external reference resistor for 2Gbps
-	 * dwc_dphy_ifc_write_mask(isys, phy_id, 0x4, 0x0, 4, 1);
-	 */
-
-	dwc_dphy_write_mask(isys, phy_id, IPU_DWC_DPHY_DFT_CTRL2, 0x1, 4, 1);
-	dwc_dphy_write_mask(isys, phy_id, IPU_DWC_DPHY_DFT_CTRL2, 0x1, 8, 1);
+	dwc_dphy_write_mask(isys, phy_id, IPU6_DWC_DPHY_DFT_CTRL2, 0x1, 4, 1);
+	dwc_dphy_write_mask(isys, phy_id, IPU6_DWC_DPHY_DFT_CTRL2, 0x1, 8, 1);
 
 	return 0;
 }
 
-void ipu6_isys_dwc_phy_aggr_setup(struct ipu_isys *isys, u32 master, u32 slave,
-				  u32 mbps)
+static void ipu6_isys_dwc_phy_aggr_setup(struct ipu6_isys *isys, u32 master,
+					 u32 slave, u32 mbps)
 {
 	/* Config mastermacro */
 	dwc_dphy_ifc_write_mask(isys, master, 0x133, 0x1, 0, 1);
@@ -443,24 +398,24 @@ void ipu6_isys_dwc_phy_aggr_setup(struct ipu_isys *isys, u32 master, u32 slave,
 	dwc_dphy_ifc_write_mask(isys, slave, 0x305, 0xa, 0, 5);
 }
 
-#define PHY_E	(4)
-int ipu6_isys_dwc_phy_powerup_ack(struct ipu_isys *isys, u32 phy_id)
+#define PHY_E	4
+static int ipu6_isys_dwc_phy_powerup_ack(struct ipu6_isys *isys, u32 phy_id)
 {
-	int rval;
+	struct device *dev = &isys->adev->auxdev.dev;
 	u32 rescal_done;
+	int ret;
 
-	rval = dwc_dphy_pwr_up(isys, phy_id);
-	if (rval != 0) {
-		dev_err(&isys->adev->dev, "dphy%u power up failed(%d)", phy_id,
-			rval);
-		return rval;
+	ret = dwc_dphy_pwr_up(isys, phy_id);
+	if (ret != 0) {
+		dev_err(dev, "Dphy %u power up failed(%d)", phy_id, ret);
+		return ret;
 	}
 
 	/* reset forcerxmode */
-	dwc_dphy_write_mask(isys, phy_id, IPU_DWC_DPHY_DFT_CTRL2, 0, 4, 1);
-	dwc_dphy_write_mask(isys, phy_id, IPU_DWC_DPHY_DFT_CTRL2, 0, 8, 1);
+	dwc_dphy_write_mask(isys, phy_id, IPU6_DWC_DPHY_DFT_CTRL2, 0, 4, 1);
+	dwc_dphy_write_mask(isys, phy_id, IPU6_DWC_DPHY_DFT_CTRL2, 0, 8, 1);
 
-	dev_dbg(&isys->adev->dev, "phy %u is ready!", phy_id);
+	dev_dbg(dev, "Dphy %u is ready!", phy_id);
 
 	if (phy_id != PHY_E || isys->phy_termcal_val)
 		return 0;
@@ -470,21 +425,112 @@ int ipu6_isys_dwc_phy_powerup_ack(struct ipu_isys *isys, u32 phy_id)
 	if (rescal_done) {
 		isys->phy_termcal_val = dwc_dphy_ifc_read_mask(isys, phy_id,
 							       0x220, 2, 4);
-		dev_dbg(&isys->adev->dev, "termcal done with value = %u",
+		dev_dbg(dev, "termcal done with value = %u",
 			isys->phy_termcal_val);
 	}
 
 	return 0;
 }
 
-void ipu6_isys_dwc_phy_reset(struct ipu_isys *isys, u32 phy_id)
+static void ipu6_isys_dwc_phy_reset(struct ipu6_isys *isys, u32 phy_id)
 {
-	dev_dbg(&isys->adev->dev, "Reset phy %u", phy_id);
+	dev_dbg(&isys->adev->auxdev.dev, "Reset phy %u", phy_id);
 
-	dwc_dphy_write(isys, phy_id, IPU_DWC_DPHY_SHUTDOWNZ, 0);
-	dwc_dphy_write(isys, phy_id, IPU_DWC_DPHY_RSTZ, 0);
-	dwc_dphy_write(isys, phy_id, IPU_DWC_DPHY_TEST_IFC_ACCESS_MODE,
+	dwc_dphy_write(isys, phy_id, IPU6_DWC_DPHY_SHUTDOWNZ, 0);
+	dwc_dphy_write(isys, phy_id, IPU6_DWC_DPHY_RSTZ, 0);
+	dwc_dphy_write(isys, phy_id, IPU6_DWC_DPHY_TEST_IFC_ACCESS_MODE,
 		       TEST_IFC_ACCESS_MODE_FSM);
-	dwc_dphy_write(isys, phy_id, IPU_DWC_DPHY_TEST_IFC_REQ,
+	dwc_dphy_write(isys, phy_id, IPU6_DWC_DPHY_TEST_IFC_REQ,
 		       TEST_IFC_REQ_RESET);
+}
+
+int ipu6_isys_dwc_phy_set_power(struct ipu6_isys *isys,
+				struct ipu6_isys_csi2_config *cfg,
+				const struct ipu6_isys_csi2_timing *timing,
+				bool on)
+{
+	struct device *dev = &isys->adev->auxdev.dev;
+	void __iomem *isys_base = isys->pdata->base;
+	u32 phy_id, primary, secondary;
+	u32 nlanes, port, mbps;
+	s64 link_freq;
+	int ret;
+
+	port = cfg->port;
+
+	if (!isys_base || port >= isys->pdata->ipdata->csi2.nports) {
+		dev_warn(dev, "invalid port ID %d\n", port);
+		return -EINVAL;
+	}
+
+	nlanes = cfg->nlanes;
+	/* only port 0, 2 and 4 support 4 lanes */
+	if (nlanes == 4 && port % 2) {
+		dev_err(dev, "invalid csi-port %u with %u lanes\n", port,
+			nlanes);
+		return -EINVAL;
+	}
+
+	link_freq = ipu6_isys_csi2_get_link_freq(&isys->csi2[port]);
+	if (link_freq < 0) {
+		dev_err(dev, "get link freq failed(%lld).\n", link_freq);
+		return link_freq;
+	}
+
+	mbps = div_u64(link_freq, 500000);
+
+	phy_id = port;
+	primary = port & ~1;
+	secondary = primary + 1;
+	if (on) {
+		if (nlanes == 4) {
+			dev_dbg(dev, "config phy %u and %u in aggr mode\n",
+				primary, secondary);
+
+			ipu6_isys_dwc_phy_reset(isys, primary);
+			ipu6_isys_dwc_phy_reset(isys, secondary);
+			ipu6_isys_dwc_phy_aggr_setup(isys, primary,
+						     secondary, mbps);
+
+			ret = ipu6_isys_dwc_phy_config(isys, primary, mbps);
+			if (ret)
+				return ret;
+			ret = ipu6_isys_dwc_phy_config(isys, secondary, mbps);
+			if (ret)
+				return ret;
+
+			ret = ipu6_isys_dwc_phy_powerup_ack(isys, primary);
+			if (ret)
+				return ret;
+
+			ret = ipu6_isys_dwc_phy_powerup_ack(isys, secondary);
+			return ret;
+		}
+
+		dev_dbg(dev, "config phy %u with %u lanes in non-aggr mode\n",
+			phy_id, nlanes);
+
+		ipu6_isys_dwc_phy_reset(isys, phy_id);
+		ret = ipu6_isys_dwc_phy_config(isys, phy_id, mbps);
+		if (ret)
+			return ret;
+
+		ret = ipu6_isys_dwc_phy_powerup_ack(isys, phy_id);
+		return ret;
+	}
+
+	if (nlanes == 4) {
+		dev_dbg(dev, "Power down phy %u and phy %u for port %u\n",
+			primary, secondary, port);
+		ipu6_isys_dwc_phy_reset(isys, secondary);
+		ipu6_isys_dwc_phy_reset(isys, primary);
+
+		return 0;
+	}
+
+	dev_dbg(dev, "Powerdown phy %u with %u lanes\n", phy_id, nlanes);
+
+	ipu6_isys_dwc_phy_reset(isys, phy_id);
+
+	return 0;
 }

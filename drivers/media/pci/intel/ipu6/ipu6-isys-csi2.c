@@ -1,261 +1,223 @@
-// SPDX-License-Identifier: GPL-2.0
-// Copyright (C) 2020 - 2024 Intel Corporation
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (C) 2013--2024 Intel Corporation
+ */
 
+#include <linux/atomic.h>
+#include <linux/bitfield.h>
+#include <linux/bits.h>
 #include <linux/delay.h>
-#include <linux/spinlock.h>
-#include <media/ipu-isys.h>
-#include "ipu.h"
-#include "ipu-buttress.h"
-#include "ipu-isys.h"
-#include "ipu-platform-buttress-regs.h"
-#include "ipu-platform-regs.h"
-#include "ipu-platform-isys-csi2-reg.h"
+#include <linux/device.h>
+#include <linux/err.h>
+#include <linux/io.h>
+#include <linux/minmax.h>
+#include <linux/sprintf.h>
+
+#include <media/media-entity.h>
+#include <media/v4l2-ctrls.h>
+#include <media/v4l2-device.h>
+#include <media/v4l2-event.h>
+#include <media/v4l2-subdev.h>
+
+#include "ipu6-bus.h"
+#include "ipu6-isys.h"
 #include "ipu6-isys-csi2.h"
-#include "ipu6-isys-phy.h"
-#include "ipu6-isys-dwc-phy.h"
-#include "ipu-isys-csi2.h"
+#include "ipu6-isys-subdev.h"
+#include "ipu6-platform-isys-csi2-reg.h"
 
-bool enable_hw_sof_irq;
-module_param(enable_hw_sof_irq, bool, 0660);
-MODULE_PARM_DESC(enable_hw_sof_irq, "enable hw sof for debug!");
-struct ipu6_csi2_error {
-	const char *error_string;
-	bool is_info_only;
-};
-
-struct ipu6_csi_irq_info_map {
-	u32 irq_error_mask;
-	u32 irq_num;
-	unsigned int irq_base;
-	unsigned int irq_base_ctrl2;
-	struct ipu6_csi2_error *errors;
+static const u32 csi2_supported_codes[] = {
+	MEDIA_BUS_FMT_RGB565_1X16,
+	MEDIA_BUS_FMT_RGB888_1X24,
+	MEDIA_BUS_FMT_UYVY8_1X16,
+	MEDIA_BUS_FMT_YUYV8_1X16,
+	MEDIA_BUS_FMT_SBGGR10_1X10,
+	MEDIA_BUS_FMT_SGBRG10_1X10,
+	MEDIA_BUS_FMT_SGRBG10_1X10,
+	MEDIA_BUS_FMT_SRGGB10_1X10,
+	MEDIA_BUS_FMT_SBGGR12_1X12,
+	MEDIA_BUS_FMT_SGBRG12_1X12,
+	MEDIA_BUS_FMT_SGRBG12_1X12,
+	MEDIA_BUS_FMT_SRGGB12_1X12,
+	MEDIA_BUS_FMT_SBGGR8_1X8,
+	MEDIA_BUS_FMT_SGBRG8_1X8,
+	MEDIA_BUS_FMT_SGRBG8_1X8,
+	MEDIA_BUS_FMT_SRGGB8_1X8,
+	MEDIA_BUS_FMT_META_8,
+	MEDIA_BUS_FMT_META_10,
+	MEDIA_BUS_FMT_META_12,
+	MEDIA_BUS_FMT_META_16,
+	MEDIA_BUS_FMT_META_24,
+	0
 };
 
 /*
  * Strings corresponding to CSI-2 receiver errors are here.
  * Corresponding macros are defined in the header file.
  */
-static struct ipu6_csi2_error dphy_rx_errors[] = {
-	{"Single packet header error corrected", true},
-	{"Multiple packet header errors detected", true},
-	{"Payload checksum (CRC) error", true},
-	{"Transfer FIFO overflow", false},
-	{"Reserved short packet data type detected", true},
-	{"Reserved long packet data type detected", true},
-	{"Incomplete long packet detected", false},
-	{"Frame sync error", false},
-	{"Line sync error", false},
-	{"DPHY recoverable synchronization error", true},
-	{"DPHY fatal error", false},
-	{"DPHY elastic FIFO overflow", false},
-	{"Inter-frame short packet discarded", true},
-	{"Inter-frame long packet discarded", true},
-	{"MIPI pktgen overflow", false},
-	{"MIPI pktgen data loss", false},
-	{"FIFO overflow", false},
-	{"Lane deskew", false},
-	{"SOT sync error", false},
-	{"HSIDLE detected", false}
+static const struct ipu6_csi2_error dphy_rx_errors[] = {
+	{ "Single packet header error corrected", true },
+	{ "Multiple packet header errors detected", true },
+	{ "Payload checksum (CRC) error", true },
+	{ "Transfer FIFO overflow", false },
+	{ "Reserved short packet data type detected", true },
+	{ "Reserved long packet data type detected", true },
+	{ "Incomplete long packet detected", false },
+	{ "Frame sync error", false },
+	{ "Line sync error", false },
+	{ "DPHY recoverable synchronization error", true },
+	{ "DPHY fatal error", false },
+	{ "DPHY elastic FIFO overflow", false },
+	{ "Inter-frame short packet discarded", true },
+	{ "Inter-frame long packet discarded", true },
+	{ "MIPI pktgen overflow", false },
+	{ "MIPI pktgen data loss", false },
+	{ "FIFO overflow", false },
+	{ "Lane deskew", false },
+	{ "SOT sync error", false },
+	{ "HSIDLE detected", false }
 };
 
-static refcount_t phy_power_ref_count[IPU_ISYS_CSI_PHY_NUM];
-
-static int ipu6_csi2_phy_power_set(struct ipu_isys *isys,
-				   struct ipu_isys_csi2_config *cfg, bool on)
+s64 ipu6_isys_csi2_get_link_freq(struct ipu6_isys_csi2 *csi2)
 {
-	int ret = 0;
-	unsigned int port, phy_id;
-	refcount_t *ref;
-	void __iomem *isys_base = isys->pdata->base;
-	unsigned int nr;
+	struct media_pad *src_pad;
+	struct v4l2_subdev *ext_sd;
+	struct device *dev;
 
-	port = cfg->port;
-	phy_id = port / 4;
-	ref = &phy_power_ref_count[phy_id];
-	dev_dbg(&isys->adev->dev, "for phy %d port %d, lanes: %d\n",
-		phy_id, port, cfg->nlanes);
-
-	nr = (ipu_ver == IPU_VER_6 || ipu_ver == IPU_VER_6EP ||
-	      ipu_ver == IPU_VER_6EP_MTL) ?
-		IPU6_ISYS_CSI_PORT_NUM : IPU6SE_ISYS_CSI_PORT_NUM;
-
-	if (!isys_base || port >= nr) {
-		dev_warn(&isys->adev->dev, "invalid port ID %d\n", port);
+	if (!csi2)
 		return -EINVAL;
+
+	dev = &csi2->isys->adev->auxdev.dev;
+	src_pad = media_entity_remote_source_pad_unique(&csi2->asd.sd.entity);
+	if (IS_ERR(src_pad)) {
+		dev_err(dev, "can't get source pad of %s (%ld)\n",
+			csi2->asd.sd.name, PTR_ERR(src_pad));
+		return PTR_ERR(src_pad);
 	}
 
-	if (on) {
-		if (refcount_read(ref)) {
-			/* already up */
-			dev_warn(&isys->adev->dev, "for phy %d is already UP",
-				 phy_id);
-			refcount_inc(ref);
-			return 0;
-		}
+	ext_sd = media_entity_to_v4l2_subdev(src_pad->entity);
+	if (WARN(!ext_sd, "Failed to get subdev for %s\n", csi2->asd.sd.name))
+		return -ENODEV;
 
-		ret = ipu6_isys_phy_powerup_ack(isys, phy_id);
-		if (ret)
-			return ret;
-
-		ipu6_isys_phy_reset(isys, phy_id, 0);
-#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
-		ipu6_isys_phy_common_init(isys, cfg);
-		ret = ipu6_isys_phy_config(isys, cfg);
-#else
-		ipu6_isys_phy_common_init(isys);
-
-		ret = ipu6_isys_phy_config(isys);
-#endif
-		if (ret)
-			return ret;
-
-		ipu6_isys_phy_reset(isys, phy_id, 1);
-		ret = ipu6_isys_phy_ready(isys, phy_id);
-		if (ret)
-			return ret;
-
-		refcount_set(ref, 1);
-		return 0;
-	}
-
-	/* power off process */
-	if (refcount_dec_and_test(ref))
-		ret = ipu6_isys_phy_powerdown_ack(isys, phy_id);
-	if (ret)
-		dev_err(&isys->adev->dev, "phy poweroff failed!");
-
-	return ret;
+	return v4l2_get_link_freq(ext_sd->ctrl_handler, 0, 0);
 }
 
-static int ipu6_csi2_dwc_phy_power_set(struct ipu_isys *isys,
-				       struct ipu_isys_csi2_config *cfg, bool on)
+static int csi2_subscribe_event(struct v4l2_subdev *sd, struct v4l2_fh *fh,
+				struct v4l2_event_subscription *sub)
 {
-	int ret = 0;
-	u32 port;
-	u32 phy_id, primary, secondary;
-	u32 nlanes;
-	u32 mbps;
-	void __iomem *isys_base = isys->pdata->base;
-	u32 nr;
+	struct ipu6_isys_subdev *asd = to_ipu6_isys_subdev(sd);
+	struct ipu6_isys_csi2 *csi2 = to_ipu6_isys_csi2(asd);
+	struct device *dev = &csi2->isys->adev->auxdev.dev;
+
+	dev_dbg(dev, "csi2 subscribe event(type %u id %u)\n",
+		sub->type, sub->id);
+
+	switch (sub->type) {
+	case V4L2_EVENT_FRAME_SYNC:
+		return v4l2_event_subscribe(fh, sub, 10, NULL);
+	case V4L2_EVENT_CTRL:
+		return v4l2_ctrl_subscribe_event(fh, sub);
+	default:
+		return -EINVAL;
+	}
+}
+
+static const struct v4l2_subdev_core_ops csi2_sd_core_ops = {
+	.subscribe_event = csi2_subscribe_event,
+	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
+};
+
+/*
+ * The input system CSI2+ receiver has several
+ * parameters affecting the receiver timings. These depend
+ * on the MIPI bus frequency F in Hz (sensor transmitter rate)
+ * as follows:
+ *	register value = (A/1e9 + B * UI) / COUNT_ACC
+ * where
+ *	UI = 1 / (2 * F) in seconds
+ *	COUNT_ACC = counter accuracy in seconds
+ *	COUNT_ACC = 0.125 ns = 1 / 8 ns, ACCINV = 8.
+ *
+ * A and B are coefficients from the table below,
+ * depending whether the register minimum or maximum value is
+ * calculated.
+ *				       Minimum     Maximum
+ * Clock lane			       A     B     A     B
+ * reg_rx_csi_dly_cnt_termen_clane     0     0    38     0
+ * reg_rx_csi_dly_cnt_settle_clane    95    -8   300   -16
+ * Data lanes
+ * reg_rx_csi_dly_cnt_termen_dlane0    0     0    35     4
+ * reg_rx_csi_dly_cnt_settle_dlane0   85    -2   145    -6
+ * reg_rx_csi_dly_cnt_termen_dlane1    0     0    35     4
+ * reg_rx_csi_dly_cnt_settle_dlane1   85    -2   145    -6
+ * reg_rx_csi_dly_cnt_termen_dlane2    0     0    35     4
+ * reg_rx_csi_dly_cnt_settle_dlane2   85    -2   145    -6
+ * reg_rx_csi_dly_cnt_termen_dlane3    0     0    35     4
+ * reg_rx_csi_dly_cnt_settle_dlane3   85    -2   145    -6
+ *
+ * We use the minimum values of both A and B.
+ */
+
+#define DIV_SHIFT	8
+#define CSI2_ACCINV	8
+
+static u32 calc_timing(s32 a, s32 b, s64 link_freq, s32 accinv)
+{
+	return accinv * a + (accinv * b * (500000000 >> DIV_SHIFT)
+			     / (s32)(link_freq >> DIV_SHIFT));
+}
+
+static int
+ipu6_isys_csi2_calc_timing(struct ipu6_isys_csi2 *csi2,
+			   struct ipu6_isys_csi2_timing *timing, s32 accinv)
+{
+	struct device *dev = &csi2->isys->adev->auxdev.dev;
 	s64 link_freq;
 
-	port = cfg->port;
+	link_freq = ipu6_isys_csi2_get_link_freq(csi2);
+	if (link_freq < 0)
+		return link_freq;
 
-	nr = (ipu_ver == IPU_VER_6 || ipu_ver == IPU_VER_6EP ||
-	      ipu_ver == IPU_VER_6EP_MTL) ?
-		IPU6_ISYS_CSI_PORT_NUM : IPU6SE_ISYS_CSI_PORT_NUM;
+	timing->ctermen = calc_timing(CSI2_CSI_RX_DLY_CNT_TERMEN_CLANE_A,
+				      CSI2_CSI_RX_DLY_CNT_TERMEN_CLANE_B,
+				      link_freq, accinv);
+	timing->csettle = calc_timing(CSI2_CSI_RX_DLY_CNT_SETTLE_CLANE_A,
+				      CSI2_CSI_RX_DLY_CNT_SETTLE_CLANE_B,
+				      link_freq, accinv);
+	timing->dtermen = calc_timing(CSI2_CSI_RX_DLY_CNT_TERMEN_DLANE_A,
+				      CSI2_CSI_RX_DLY_CNT_TERMEN_DLANE_B,
+				      link_freq, accinv);
+	timing->dsettle = calc_timing(CSI2_CSI_RX_DLY_CNT_SETTLE_DLANE_A,
+				      CSI2_CSI_RX_DLY_CNT_SETTLE_DLANE_B,
+				      link_freq, accinv);
 
-	if (!isys_base || port >= nr) {
-		dev_warn(&isys->adev->dev, "invalid port ID %d\n", port);
-		return -EINVAL;
-	}
-
-	nlanes = cfg->nlanes;
-	/* only port a/c/e support 4 lanes */
-	if (nlanes == 4 && port % 2) {
-		dev_err(&isys->adev->dev, "invalid csi-port %u with %u lanes\n",
-			port, nlanes);
-		return -EINVAL;
-	}
-
-	ret = ipu_isys_csi2_get_link_freq(&isys->csi2[port], &link_freq);
-	if (ret) {
-		dev_err(&isys->adev->dev,
-			"get link freq failed(%d).\n", ret);
-		return ret;
-	}
-
-	do_div(link_freq, 1000000);
-	mbps = link_freq * 2;
-
-	phy_id = port;
-	primary = port & ~1;
-	secondary = primary + 1;
-	if (on) {
-		if (nlanes == 4) {
-			dev_dbg(&isys->adev->dev,
-				"config phy %u and %u in aggregation mode",
-				primary, secondary);
-
-			ipu6_isys_dwc_phy_reset(isys, primary);
-			ipu6_isys_dwc_phy_reset(isys, secondary);
-			ipu6_isys_dwc_phy_aggr_setup(isys, primary,
-						     secondary, mbps);
-
-			ret = ipu6_isys_dwc_phy_config(isys, primary, mbps);
-			if (ret)
-				return ret;
-			ret = ipu6_isys_dwc_phy_config(isys, secondary, mbps);
-			if (ret)
-				return ret;
-
-			ret = ipu6_isys_dwc_phy_powerup_ack(isys, primary);
-			if (ret)
-				return ret;
-			ret = ipu6_isys_dwc_phy_powerup_ack(isys, secondary);
-			if (ret)
-				return ret;
-
-			return 0;
-		}
-
-		dev_dbg(&isys->adev->dev,
-			"config phy %u with %u lanes in non-aggr mode",
-			phy_id, nlanes);
-
-		ipu6_isys_dwc_phy_reset(isys, phy_id);
-		ret = ipu6_isys_dwc_phy_config(isys, phy_id, mbps);
-		if (ret)
-			return ret;
-
-		ret = ipu6_isys_dwc_phy_powerup_ack(isys, phy_id);
-		if (ret)
-			return ret;
-
-		return 0;
-	}
-
-	if (nlanes == 4) {
-		dev_dbg(&isys->adev->dev,
-			"Powerdown phy %u and phy %u for port %u",
-			primary, secondary, port);
-		ipu6_isys_dwc_phy_reset(isys, secondary);
-		ipu6_isys_dwc_phy_reset(isys, primary);
-
-		return 0;
-	}
-
-	dev_dbg(&isys->adev->dev,
-		"Powerdown phy %u with %u lanes", phy_id, nlanes);
-
-	ipu6_isys_dwc_phy_reset(isys, phy_id);
+	dev_dbg(dev, "ctermen %u csettle %u dtermen %u dsettle %u\n",
+		timing->ctermen, timing->csettle,
+		timing->dtermen, timing->dsettle);
 
 	return 0;
 }
 
-static void ipu6_isys_register_errors(struct ipu_isys_csi2 *csi2)
+void ipu6_isys_register_errors(struct ipu6_isys_csi2 *csi2)
 {
-	u32 mask = 0;
 	u32 irq = readl(csi2->base + CSI_PORT_REG_BASE_IRQ_CSI +
 			CSI_PORT_REG_BASE_IRQ_STATUS_OFFSET);
+	struct ipu6_isys *isys = csi2->isys;
+	u32 mask;
 
-	mask = (ipu_ver == IPU_VER_6 || ipu_ver == IPU_VER_6EP ||
-		ipu_ver == IPU_VER_6EP_MTL) ?
-		IPU6_CSI_RX_ERROR_IRQ_MASK : IPU6SE_CSI_RX_ERROR_IRQ_MASK;
-
-	writel(irq & mask,
-	       csi2->base + CSI_PORT_REG_BASE_IRQ_CSI +
+	mask = isys->pdata->ipdata->csi2.irq_mask;
+	writel(irq & mask, csi2->base + CSI_PORT_REG_BASE_IRQ_CSI +
 	       CSI_PORT_REG_BASE_IRQ_CLEAR_OFFSET);
 	csi2->receiver_errors |= irq & mask;
 }
 
-void ipu_isys_csi2_error(struct ipu_isys_csi2 *csi2)
+void ipu6_isys_csi2_error(struct ipu6_isys_csi2 *csi2)
 {
-	struct ipu6_csi2_error *errors;
+	struct device *dev = &csi2->isys->adev->auxdev.dev;
+	const struct ipu6_csi2_error *errors;
 	u32 status;
-	unsigned int i;
+	u32 i;
 
-	/* Register errors once more in case of error interrupts are disabled */
+	/* register errors once more in case of interrupts are disabled */
 	ipu6_isys_register_errors(csi2);
 	status = csi2->receiver_errors;
 	csi2->receiver_errors = 0;
@@ -263,222 +225,38 @@ void ipu_isys_csi2_error(struct ipu_isys_csi2 *csi2)
 
 	for (i = 0; i < CSI_RX_NUM_ERRORS_IN_IRQ; i++) {
 		if (status & BIT(i))
-			dev_err_ratelimited(&csi2->isys->adev->dev,
-					    "csi2-%i error: %s\n",
-					    csi2->index,
-					    errors[i].error_string);
+			dev_err_ratelimited(dev, "csi2-%i error: %s\n",
+					    csi2->port, errors[i].error_string);
 	}
 }
 
-const unsigned int csi2_port_cfg[][3] = {
-	{0, 0, 0x1f}, /* no link */
-	{4, 0, 0x10}, /* x4 + x4 config */
-	{2, 0, 0x12}, /* x2 + x2 config */
-	{1, 0, 0x13}, /* x1 + x1 config */
-	{2, 1, 0x15}, /* x2x1 + x2x1 config */
-	{1, 1, 0x16}, /* x1x1 + x1x1 config */
-	{2, 2, 0x18}, /* x2x2 + x2x2 config */
-	{1, 2, 0x19}, /* x1x2 + x1x2 config */
-};
-
-const unsigned int phy_port_cfg[][4] = {
-	/* port, nlanes, bbindex, portcfg */
-	/* sip0 */
-	{0, 1, 0, 0x15},
-	{0, 2, 0, 0x15},
-	{0, 4, 0, 0x15},
-	{0, 4, 2, 0x22},
-	/* sip1 */
-	{2, 1, 4, 0x15},
-	{2, 2, 4, 0x15},
-	{2, 4, 4, 0x15},
-	{2, 4, 6, 0x22},
-};
-
-static int ipu_isys_csi2_phy_config_by_port(struct ipu_isys *isys,
-					    unsigned int port,
-					    unsigned int nlanes)
+static int ipu6_isys_csi2_set_stream(struct v4l2_subdev *sd,
+				     const struct ipu6_isys_csi2_timing *timing,
+				     unsigned int nlanes, int enable)
 {
-	void __iomem *base = isys->adev->isp->base;
-	u32 val, reg, i;
-	unsigned int bbnum;
-
-	dev_dbg(&isys->adev->dev, "%s port %u with %u lanes", __func__,
-		port, nlanes);
-
-	/* hard code for x2x2 + x2x2 with <1.5Gbps */
-	for (i = 0; i < IPU6SE_ISYS_PHY_BB_NUM; i++) {
-		/* cphy_dll_ovrd.crcdc_fsm_dlane0 = 13 */
-		reg = IPU6SE_ISYS_PHY_0_BASE + PHY_CPHY_DLL_OVRD(i);
-		val = readl(base + reg);
-		val |= 13 << 1;
-		/* val &= ~0x1; */
-		writel(val, base + reg);
-
-		/* cphy_rx_control1.en_crc1 = 1 */
-		reg = IPU6SE_ISYS_PHY_0_BASE + PHY_CPHY_RX_CONTROL1(i);
-		val = readl(base + reg);
-		val |= 0x1 << 31;
-		writel(val, base + reg);
-
-		/* dphy_cfg.reserved = 1
-		 * dphy_cfg.lden_from_dll_ovrd_0 = 1
-		 */
-		reg = IPU6SE_ISYS_PHY_0_BASE + PHY_DPHY_CFG(i);
-		val = readl(base + reg);
-		val |= 0x1 << 25;
-		val |= 0x1 << 26;
-		writel(val, base + reg);
-
-		/* cphy_dll_ovrd.lden_crcdc_fsm_dlane0 = 1 */
-		reg = IPU6SE_ISYS_PHY_0_BASE + PHY_CPHY_DLL_OVRD(i);
-		val = readl(base + reg);
-		val |= 1;
-		writel(val, base + reg);
-	}
-
-	/* bb afe config, use minimal channel loss */
-	for (i = 0; i < ARRAY_SIZE(phy_port_cfg); i++) {
-		if (phy_port_cfg[i][0] == port &&
-		    phy_port_cfg[i][1] == nlanes) {
-			bbnum = phy_port_cfg[i][2] / 2;
-			reg = IPU6SE_ISYS_PHY_0_BASE + PHY_BB_AFE_CONFIG(bbnum);
-			val = readl(base + reg);
-			val |= phy_port_cfg[i][3];
-			writel(val, base + reg);
-		}
-	}
-
-	return 0;
-}
-
-static void ipu_isys_csi2_rx_control(struct ipu_isys *isys)
-{
-	void __iomem *base = isys->adev->isp->base;
-	u32 val, reg;
-
-	/* lp11 release */
-	reg = CSI2_HUB_GPREG_SIP0_CSI_RX_A_CONTROL;
-	val = readl(base + reg);
-	val |= 0x1;
-	writel(0x1, base + CSI2_HUB_GPREG_SIP0_CSI_RX_A_CONTROL);
-
-	reg = CSI2_HUB_GPREG_SIP0_CSI_RX_B_CONTROL;
-	val = readl(base + reg);
-	val |= 0x1;
-	writel(0x1, base + CSI2_HUB_GPREG_SIP0_CSI_RX_B_CONTROL);
-
-	reg = CSI2_HUB_GPREG_SIP1_CSI_RX_A_CONTROL;
-	val = readl(base + reg);
-	val |= 0x1;
-	writel(0x1, base + CSI2_HUB_GPREG_SIP1_CSI_RX_A_CONTROL);
-
-	reg = CSI2_HUB_GPREG_SIP1_CSI_RX_B_CONTROL;
-	val = readl(base + reg);
-	val |= 0x1;
-	writel(0x1, base + CSI2_HUB_GPREG_SIP1_CSI_RX_B_CONTROL);
-}
-
-static int ipu_isys_csi2_set_port_cfg(struct v4l2_subdev *sd, unsigned int port,
-				      unsigned int nlanes)
-{
-	struct ipu_isys_csi2 *csi2 = to_ipu_isys_csi2(sd);
-	struct ipu_isys *isys = csi2->isys;
-	unsigned int sip = port / 2;
-	unsigned int index;
-
-	switch (nlanes) {
-	case 1:
-		index = 5;
-		break;
-	case 2:
-		index = 6;
-		break;
-	case 4:
-		index = 1;
-		break;
-	default:
-		dev_err(&isys->adev->dev, "lanes nr %u is unsupported\n",
-			nlanes);
-		return -EINVAL;
-	}
-
-	dev_dbg(&isys->adev->dev, "port config for port %u with %u lanes\n",
-		port, nlanes);
-	writel(csi2_port_cfg[index][2],
-	       isys->pdata->base + CSI2_HUB_GPREG_SIP_FB_PORT_CFG(sip));
-
-	return 0;
-}
-
-static void ipu_isys_csi2_set_timing(struct v4l2_subdev *sd,
-				     struct ipu_isys_csi2_timing timing,
-				     unsigned int port,
-				     unsigned int nlanes)
-{
-	u32 port_base;
-	void __iomem *reg;
-	struct ipu_isys_csi2 *csi2 = to_ipu_isys_csi2(sd);
-	struct ipu_isys *isys = csi2->isys;
-	unsigned int i;
-
-	port_base = (port % 2) ? CSI2_SIP_TOP_CSI_RX_PORT_BASE_1(port) :
-		CSI2_SIP_TOP_CSI_RX_PORT_BASE_0(port);
-
-	dev_dbg(&isys->adev->dev,
-		"set timing for port %u base 0x%x with %u lanes\n",
-		port, port_base, nlanes);
-
-	reg = isys->pdata->base + port_base;
-	reg += CSI2_SIP_TOP_CSI_RX_DLY_CNT_TERMEN_CLANE;
-
-	writel(timing.ctermen, reg);
-
-	reg = isys->pdata->base + port_base;
-	reg += CSI2_SIP_TOP_CSI_RX_DLY_CNT_SETTLE_CLANE;
-	writel(timing.csettle, reg);
-
-	for (i = 0; i < nlanes; i++) {
-		reg = isys->pdata->base + port_base;
-		reg += CSI2_SIP_TOP_CSI_RX_DLY_CNT_TERMEN_DLANE(i);
-		writel(timing.dtermen, reg);
-
-		reg = isys->pdata->base + port_base;
-		reg += CSI2_SIP_TOP_CSI_RX_DLY_CNT_SETTLE_DLANE(i);
-		writel(timing.dsettle, reg);
-	}
-}
-
-int ipu_isys_csi2_set_stream(struct v4l2_subdev *sd,
-			     struct ipu_isys_csi2_timing timing,
-			     unsigned int nlanes, int enable)
-{
-	struct ipu_isys_csi2 *csi2 = to_ipu_isys_csi2(sd);
-	struct ipu_isys *isys = csi2->isys;
-	struct media_pipeline *mp = media_entity_pipeline(&sd->entity);
-	struct ipu_isys_pipeline *ip = container_of(mp,
-						    struct ipu_isys_pipeline,
-						    pipe);
-	struct ipu_isys_csi2_config *cfg =
-		v4l2_get_subdev_hostdata(media_entity_to_v4l2_subdev
-					 (ip->external->entity));
-	unsigned int port, port_max;
+	struct ipu6_isys_subdev *asd = to_ipu6_isys_subdev(sd);
+	struct ipu6_isys_csi2 *csi2 = to_ipu6_isys_csi2(asd);
+	struct ipu6_isys *isys = csi2->isys;
+	struct device *dev = &isys->adev->auxdev.dev;
+	struct ipu6_isys_csi2_config cfg;
+	unsigned int nports;
 	int ret = 0;
 	u32 mask = 0;
-	unsigned int i;
+	u32 i;
 
-	port = cfg->port;
-	dev_dbg(&isys->adev->dev, "for port %u with %u lanes\n", port, nlanes);
+	dev_dbg(dev, "stream %s CSI2-%u with %u lanes\n", enable ? "on" : "off",
+		csi2->port, nlanes);
 
-	mask = (ipu_ver == IPU_VER_6 || ipu_ver == IPU_VER_6EP ||
-		ipu_ver == IPU_VER_6EP_MTL) ?
-		IPU6_CSI_RX_ERROR_IRQ_MASK : IPU6SE_CSI_RX_ERROR_IRQ_MASK;
+	cfg.port = csi2->port;
+	cfg.nlanes = nlanes;
+
+	mask = isys->pdata->ipdata->csi2.irq_mask;
+	nports = isys->pdata->ipdata->csi2.nports;
 
 	if (!enable) {
 		writel(0, csi2->base + CSI_REG_CSI_FE_ENABLE);
 		writel(0, csi2->base + CSI_REG_PPI2CSI_ENABLE);
 
-		/* Disable interrupts */
 		writel(0,
 		       csi2->base + CSI_PORT_REG_BASE_IRQ_CSI +
 		       CSI_PORT_REG_BASE_IRQ_ENABLE_OFFSET);
@@ -492,18 +270,13 @@ int ipu_isys_csi2_set_stream(struct v4l2_subdev *sd,
 		       csi2->base + CSI_PORT_REG_BASE_IRQ_CSI_SYNC +
 		       CSI_PORT_REG_BASE_IRQ_CLEAR_OFFSET);
 
-		/* power down phy */
-		if (ipu_ver == IPU_VER_6EP_MTL)
-			ret = ipu6_csi2_dwc_phy_power_set(isys, cfg, false);
+		isys->phy_set_power(isys, &cfg, timing, false);
 
-		if (ipu_ver == IPU_VER_6 || ipu_ver == IPU_VER_6EP)
-			ret = ipu6_csi2_phy_power_set(isys, cfg, false);
-
-		/* Disable clock */
+		writel(0, isys->pdata->base + CSI_REG_HUB_FW_ACCESS_PORT
+		       (isys->pdata->ipdata->csi2.fw_access_port_ofs,
+			csi2->port));
 		writel(0, isys->pdata->base +
-		       CSI_REG_HUB_FW_ACCESS_PORT(port));
-		writel(0, isys->pdata->base +
-		       CSI_REG_HUB_DRV_ACCESS_PORT(port));
+		       CSI_REG_HUB_DRV_ACCESS_PORT(csi2->port));
 
 		return ret;
 	}
@@ -513,20 +286,11 @@ int ipu_isys_csi2_set_stream(struct v4l2_subdev *sd,
 	usleep_range(100, 200);
 	writel(0x0, csi2->base + CSI_REG_PORT_GPREG_SRST);
 
-	/* We need enable clock for all ports for MTL */
-	port_max = (ipu_ver == IPU_VER_6 || ipu_ver == IPU_VER_6EP ||
-		    ipu_ver == IPU_VER_6EP_MTL) ?
-		IPU6_ISYS_CSI_PORT_NUM : IPU6SE_ISYS_CSI_PORT_NUM;
-
-	/* Enable port clock */
-	for (i = 0; i < port_max; i++) {
+	/* enable port clock */
+	for (i = 0; i < nports; i++) {
 		writel(1, isys->pdata->base + CSI_REG_HUB_DRV_ACCESS_PORT(i));
-		if (ipu_ver == IPU_VER_6EP_MTL)
-			writel(1, isys->pdata->base +
-			       IPU6V6_CSI_REG_HUB_FW_ACCESS_PORT(i));
-		else
-			writel(1, isys->pdata->base +
-			       CSI_REG_HUB_FW_ACCESS_PORT(i));
+		writel(1, isys->pdata->base + CSI_REG_HUB_FW_ACCESS_PORT
+		       (isys->pdata->ipdata->csi2.fw_access_port_ofs, i));
 	}
 
 	/* enable all error related irq */
@@ -546,13 +310,14 @@ int ipu_isys_csi2_set_stream(struct v4l2_subdev *sd,
 	       csi2->base + CSI_PORT_REG_BASE_IRQ_CSI +
 	       CSI_PORT_REG_BASE_IRQ_ENABLE_OFFSET);
 
-	/* To save CPU wakeups, disable CSI SOF/EOF irq */
+	/*
+	 * Using event from firmware instead of irq to handle CSI2 sync event
+	 * which can reduce system wakeups. If CSI2 sync irq enabled, we need
+	 * disable the firmware CSI2 sync event to avoid duplicate handling.
+	 */
 	writel(0xffffffff, csi2->base + CSI_PORT_REG_BASE_IRQ_CSI_SYNC +
 	       CSI_PORT_REG_BASE_IRQ_STATUS_OFFSET);
-	dev_dbg(&isys->adev->dev, "HW CSI SOF irq enable %d\n",
-		enable_hw_sof_irq);
-	writel(enable_hw_sof_irq ? 0x55555555 : 0,
-	       csi2->base + CSI_PORT_REG_BASE_IRQ_CSI_SYNC +
+	writel(0, csi2->base + CSI_PORT_REG_BASE_IRQ_CSI_SYNC +
 	       CSI_PORT_REG_BASE_IRQ_MASK_OFFSET);
 	writel(0xffffffff, csi2->base + CSI_PORT_REG_BASE_IRQ_CSI_SYNC +
 	       CSI_PORT_REG_BASE_IRQ_CLEAR_OFFSET);
@@ -561,101 +326,371 @@ int ipu_isys_csi2_set_stream(struct v4l2_subdev *sd,
 	writel(0xffffffff, csi2->base + CSI_PORT_REG_BASE_IRQ_CSI_SYNC +
 	       CSI_PORT_REG_BASE_IRQ_ENABLE_OFFSET);
 
-	/* Configure FE/PPI2CSI and enable FE/ PPI2CSI */
+	/* configure to enable FE and PPI2CSI */
 	writel(0, csi2->base + CSI_REG_CSI_FE_MODE);
 	writel(CSI_SENSOR_INPUT, csi2->base + CSI_REG_CSI_FE_MUX_CTRL);
 	writel(CSI_CNTR_SENSOR_LINE_ID | CSI_CNTR_SENSOR_FRAME_ID,
 	       csi2->base + CSI_REG_CSI_FE_SYNC_CNTR_SEL);
-	writel(((nlanes - 1) <<
-		PPI_INTF_CONFIG_NOF_ENABLED_DATALANES_SHIFT) |
-	       (0 << PPI_INTF_CONFIG_RX_AUTO_CLKGATING_SHIFT),
+	writel(FIELD_PREP(PPI_INTF_CONFIG_NOF_ENABLED_DLANES_MASK, nlanes - 1),
 	       csi2->base + CSI_REG_PPI2CSI_CONFIG_PPI_INTF);
-	writel(0x06, csi2->base + CSI_REG_PPI2CSI_CONFIG_CSI_FEATURE);
+
 	writel(1, csi2->base + CSI_REG_PPI2CSI_ENABLE);
 	writel(1, csi2->base + CSI_REG_CSI_FE_ENABLE);
 
-	if (ipu_ver == IPU_VER_6 || ipu_ver == IPU_VER_6EP) {
-		/* Enable DPHY power */
-		ret = ipu6_csi2_phy_power_set(isys, cfg, true);
-		if (ret) {
-			dev_err(&isys->adev->dev,
-				"CSI-%d PHY power up failed %d\n",
-				cfg->port, ret);
-			return ret;
-		}
-	} else if (ipu_ver == IPU_VER_6EP_MTL) {
-		/* Enable DWC DPHY power */
-		ret = ipu6_csi2_dwc_phy_power_set(isys, cfg, true);
-		if (ret) {
-			dev_err(&isys->adev->dev,
-				"CSI-%d DWC-PHY power up failed %d\n",
-				cfg->port, ret);
-			return ret;
-		}
-	} else if (ipu_ver == IPU_VER_6SE) {
-		ipu_isys_csi2_phy_config_by_port(isys, port, nlanes);
+	ret = isys->phy_set_power(isys, &cfg, timing, true);
+	if (ret)
+		dev_err(dev, "csi-%d phy power up failed %d\n", csi2->port,
+			ret);
 
-		/* 9'b00010.1000 for 400Mhz isys freqency */
-		writel(0x28,
-		       isys->pdata->base + CSI2_HUB_GPREG_DPHY_TIMER_INCR);
-		/* set port cfg and rx timing */
-		ipu_isys_csi2_set_timing(sd, timing, port, nlanes);
+	return ret;
+}
 
-		ret = ipu_isys_csi2_set_port_cfg(sd, port, nlanes);
+/*
+ * Maximum stream ID is 63 for now, as we use u64 bitmask to represent a set
+ * of streams.
+ */
+#define CSI2_SUBDEV_MAX_STREAM_ID 63
+
+static int ipu6_isys_csi2_enable_streams(struct v4l2_subdev *sd,
+					 struct v4l2_subdev_state *state,
+					 u32 pad, u64 streams_mask)
+{
+	struct ipu6_isys_subdev *asd = to_ipu6_isys_subdev(sd);
+	struct ipu6_isys_csi2 *csi2 = to_ipu6_isys_csi2(asd);
+	struct ipu6_isys_csi2_timing timing = { };
+	u32 sink_pad, sink_stream;
+	struct v4l2_subdev *r_sd;
+	struct media_pad *r_pad;
+	int ret, i;
+
+	if (!csi2->stream_count) {
+		ret = ipu6_isys_csi2_calc_timing(csi2, &timing, CSI2_ACCINV);
 		if (ret)
 			return ret;
 
-		ipu_isys_csi2_rx_control(isys);
+		ret = ipu6_isys_csi2_set_stream(sd, &timing, csi2->nlanes,
+						true);
+		if (ret)
+			return ret;
 	}
+
+	for (i = 0; i <= CSI2_SUBDEV_MAX_STREAM_ID; i++) {
+		if (streams_mask & BIT_ULL(i))
+			break;
+	}
+
+	ret = v4l2_subdev_routing_find_opposite_end(&state->routing, pad, i,
+						    &sink_pad, &sink_stream);
+	if (ret)
+		return ret;
+
+	r_pad = media_pad_remote_pad_first(&sd->entity.pads[CSI2_PAD_SINK]);
+	r_sd = media_entity_to_v4l2_subdev(r_pad->entity);
+
+	ret = v4l2_subdev_enable_streams(r_sd, r_pad->index,
+					 BIT_ULL(sink_stream));
+	if (!ret) {
+		csi2->stream_count++;
+		return 0;
+	}
+
+	if (!csi2->stream_count)
+		ipu6_isys_csi2_set_stream(sd, NULL, 0, false);
+
+	return ret;
+}
+
+static int ipu6_isys_csi2_disable_streams(struct v4l2_subdev *sd,
+					  struct v4l2_subdev_state *state,
+					  u32 pad, u64 streams_mask)
+{
+	struct ipu6_isys_subdev *asd = to_ipu6_isys_subdev(sd);
+	struct ipu6_isys_csi2 *csi2 = to_ipu6_isys_csi2(asd);
+	u32 sink_pad, sink_stream;
+	struct v4l2_subdev *r_sd;
+	struct media_pad *r_pad;
+	int ret, i;
+
+	for (i = 0; i <= CSI2_SUBDEV_MAX_STREAM_ID; i++) {
+		if (streams_mask & BIT_ULL(i))
+			break;
+	}
+
+	ret = v4l2_subdev_routing_find_opposite_end(&state->routing, pad, i,
+						    &sink_pad, &sink_stream);
+	if (ret)
+		return ret;
+
+	r_pad = media_pad_remote_pad_first(&sd->entity.pads[CSI2_PAD_SINK]);
+	r_sd = media_entity_to_v4l2_subdev(r_pad->entity);
+
+	v4l2_subdev_disable_streams(r_sd, r_pad->index, BIT_ULL(sink_stream));
+
+	if (--csi2->stream_count)
+		return 0;
+
+	dev_dbg(&csi2->isys->adev->auxdev.dev,
+		"stream off CSI2-%u with %u lanes\n", csi2->port, csi2->nlanes);
+
+	ipu6_isys_csi2_set_stream(sd, NULL, 0, false);
 
 	return 0;
 }
 
-void ipu_isys_csi2_isr(struct ipu_isys_csi2 *csi2)
+static int ipu6_isys_csi2_set_sel(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *state,
+				  struct v4l2_subdev_selection *sel)
 {
-	u32 status;
-	unsigned int i;
+	struct ipu6_isys_subdev *asd = to_ipu6_isys_subdev(sd);
+	struct device *dev = &asd->isys->adev->auxdev.dev;
+	struct v4l2_mbus_framefmt *sink_ffmt;
+	struct v4l2_mbus_framefmt *src_ffmt;
+	struct v4l2_rect *crop;
 
-	ipu6_isys_register_errors(csi2);
+	if (sel->pad == CSI2_PAD_SINK || sel->target != V4L2_SEL_TGT_CROP)
+		return -EINVAL;
 
-	status = readl(csi2->base + CSI_PORT_REG_BASE_IRQ_CSI_SYNC +
-		       CSI_PORT_REG_BASE_IRQ_STATUS_OFFSET);
+	sink_ffmt = v4l2_subdev_state_get_opposite_stream_format(state,
+								 sel->pad,
+								 sel->stream);
+	if (!sink_ffmt)
+		return -EINVAL;
 
-	writel(status, csi2->base + CSI_PORT_REG_BASE_IRQ_CSI_SYNC +
-	       CSI_PORT_REG_BASE_IRQ_CLEAR_OFFSET);
+	src_ffmt = v4l2_subdev_state_get_format(state, sel->pad, sel->stream);
+	if (!src_ffmt)
+		return -EINVAL;
 
-	for (i = 0; i < NR_OF_CSI2_VC; i++) {
-		if (status & IPU_CSI_RX_IRQ_FS_VC(i))
-			ipu_isys_csi2_sof_event(csi2, i);
+	crop = v4l2_subdev_state_get_crop(state, sel->pad, sel->stream);
+	if (!crop)
+		return -EINVAL;
 
-		if (status & IPU_CSI_RX_IRQ_FE_VC(i))
-			ipu_isys_csi2_eof_event(csi2, i);
-	}
+	/* Only vertical cropping is supported */
+	sel->r.left = 0;
+	sel->r.width = sink_ffmt->width;
+	/* Non-bayer formats can't be single line cropped */
+	if (!ipu6_isys_is_bayer_format(sink_ffmt->code))
+		sel->r.top &= ~1;
+	sel->r.height = clamp(sel->r.height & ~1, IPU6_ISYS_MIN_HEIGHT,
+			      sink_ffmt->height - sel->r.top);
+	*crop = sel->r;
+
+	/* update source pad format */
+	src_ffmt->width = sel->r.width;
+	src_ffmt->height = sel->r.height;
+	if (ipu6_isys_is_bayer_format(sink_ffmt->code))
+		src_ffmt->code = ipu6_isys_convert_bayer_order(sink_ffmt->code,
+							       sel->r.left,
+							       sel->r.top);
+	dev_dbg(dev, "set crop for %s sel: %d,%d,%d,%d code: 0x%x\n",
+		sd->name, sel->r.left, sel->r.top, sel->r.width, sel->r.height,
+		src_ffmt->code);
+
+	return 0;
 }
 
-unsigned int ipu_isys_csi2_get_current_field(struct ipu_isys_pipeline *ip,
-					     unsigned int *timestamp)
+static int ipu6_isys_csi2_get_sel(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *state,
+				  struct v4l2_subdev_selection *sel)
 {
-	struct ipu_isys_video *av = container_of(ip, struct ipu_isys_video, ip);
-	struct ipu_isys *isys = av->isys;
-	unsigned int field = V4L2_FIELD_TOP;
+	struct v4l2_mbus_framefmt *sink_ffmt;
+	struct v4l2_rect *crop;
+	int ret = 0;
 
-	struct ipu_isys_buffer *short_packet_ib =
-		list_last_entry(&ip->short_packet_active,
-				struct ipu_isys_buffer, head);
-	struct ipu_isys_private_buffer *pb =
-		ipu_isys_buffer_to_private_buffer(short_packet_ib);
-	struct ipu_isys_mipi_packet_header *ph =
-		(struct ipu_isys_mipi_packet_header *)
-		pb->buffer;
+	if (sd->entity.pads[sel->pad].flags & MEDIA_PAD_FL_SINK)
+		return -EINVAL;
 
-	/* Check if the first SOF packet is received. */
-	if ((ph->dtype & IPU_ISYS_SHORT_PACKET_DTYPE_MASK) != 0)
-		dev_warn(&isys->adev->dev, "First short packet is not SOF.\n");
-	field = (ph->word_count % 2) ? V4L2_FIELD_TOP : V4L2_FIELD_BOTTOM;
-	dev_dbg(&isys->adev->dev,
-		"Interlaced field ready. frame_num = %d field = %d\n",
-		ph->word_count, field);
+	sink_ffmt = v4l2_subdev_state_get_opposite_stream_format(state,
+								 sel->pad,
+								 sel->stream);
+	if (!sink_ffmt)
+		return -EINVAL;
 
-	return field;
+	crop = v4l2_subdev_state_get_crop(state, sel->pad, sel->stream);
+	if (!crop)
+		return -EINVAL;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = sink_ffmt->width;
+		sel->r.height = sink_ffmt->height;
+		break;
+	case V4L2_SEL_TGT_CROP:
+		sel->r = *crop;
+		break;
+	default:
+		ret = -EINVAL;
+	}
+
+	return ret;
+}
+
+static const struct v4l2_subdev_pad_ops csi2_sd_pad_ops = {
+	.get_fmt = v4l2_subdev_get_fmt,
+	.set_fmt = ipu6_isys_subdev_set_fmt,
+	.get_selection = ipu6_isys_csi2_get_sel,
+	.set_selection = ipu6_isys_csi2_set_sel,
+	.enum_mbus_code = ipu6_isys_subdev_enum_mbus_code,
+	.set_routing = ipu6_isys_subdev_set_routing,
+	.enable_streams = ipu6_isys_csi2_enable_streams,
+	.disable_streams = ipu6_isys_csi2_disable_streams,
+};
+
+static const struct v4l2_subdev_ops csi2_sd_ops = {
+	.core = &csi2_sd_core_ops,
+	.pad = &csi2_sd_pad_ops,
+};
+
+static const struct media_entity_operations csi2_entity_ops = {
+	.link_validate = v4l2_subdev_link_validate,
+	.has_pad_interdep = v4l2_subdev_has_pad_interdep,
+};
+
+void ipu6_isys_csi2_cleanup(struct ipu6_isys_csi2 *csi2)
+{
+	if (!csi2->isys)
+		return;
+
+	v4l2_device_unregister_subdev(&csi2->asd.sd);
+	v4l2_subdev_cleanup(&csi2->asd.sd);
+	ipu6_isys_subdev_cleanup(&csi2->asd);
+	csi2->isys = NULL;
+}
+
+int ipu6_isys_csi2_init(struct ipu6_isys_csi2 *csi2,
+			struct ipu6_isys *isys,
+			void __iomem *base, unsigned int index)
+{
+	struct device *dev = &isys->adev->auxdev.dev;
+	int ret;
+
+	csi2->isys = isys;
+	csi2->base = base;
+	csi2->port = index;
+
+	csi2->asd.sd.entity.ops = &csi2_entity_ops;
+	csi2->asd.isys = isys;
+	ret = ipu6_isys_subdev_init(&csi2->asd, &csi2_sd_ops, 0,
+				    NR_OF_CSI2_SINK_PADS, NR_OF_CSI2_SRC_PADS);
+	if (ret)
+		goto fail;
+
+	csi2->asd.source = IPU6_FW_ISYS_STREAM_SRC_CSI2_PORT0 + index;
+	csi2->asd.supported_codes = csi2_supported_codes;
+	snprintf(csi2->asd.sd.name, sizeof(csi2->asd.sd.name),
+		 IPU6_ISYS_ENTITY_PREFIX " CSI2 %u", index);
+	v4l2_set_subdevdata(&csi2->asd.sd, &csi2->asd);
+	ret = v4l2_subdev_init_finalize(&csi2->asd.sd);
+	if (ret) {
+		dev_err(dev, "failed to init v4l2 subdev\n");
+		goto fail;
+	}
+
+	ret = v4l2_device_register_subdev(&isys->v4l2_dev, &csi2->asd.sd);
+	if (ret) {
+		dev_err(dev, "failed to register v4l2 subdev\n");
+		goto fail;
+	}
+
+	return 0;
+
+fail:
+	ipu6_isys_csi2_cleanup(csi2);
+
+	return ret;
+}
+
+void ipu6_isys_csi2_sof_event_by_stream(struct ipu6_isys_stream *stream)
+{
+	struct video_device *vdev = stream->asd->sd.devnode;
+	struct device *dev = &stream->isys->adev->auxdev.dev;
+	struct ipu6_isys_csi2 *csi2 = ipu6_isys_subdev_to_csi2(stream->asd);
+	struct v4l2_event ev = {
+		.type = V4L2_EVENT_FRAME_SYNC,
+	};
+
+	ev.id = stream->vc;
+	ev.u.frame_sync.frame_sequence = atomic_fetch_inc(&stream->sequence);
+	v4l2_event_queue(vdev, &ev);
+
+	dev_dbg(dev, "sof_event::csi2-%i sequence: %i, vc: %d\n",
+		csi2->port, ev.u.frame_sync.frame_sequence, stream->vc);
+}
+
+void ipu6_isys_csi2_eof_event_by_stream(struct ipu6_isys_stream *stream)
+{
+	struct device *dev = &stream->isys->adev->auxdev.dev;
+	struct ipu6_isys_csi2 *csi2 = ipu6_isys_subdev_to_csi2(stream->asd);
+	u32 frame_sequence = atomic_read(&stream->sequence);
+
+	dev_dbg(dev, "eof_event::csi2-%i sequence: %i\n",
+		csi2->port, frame_sequence);
+}
+
+int ipu6_isys_csi2_get_remote_desc(u32 source_stream,
+				   struct ipu6_isys_csi2 *csi2,
+				   struct media_entity *source_entity,
+				   struct v4l2_mbus_frame_desc_entry *entry,
+				   int *nr_queues)
+{
+	struct v4l2_mbus_frame_desc_entry *desc_entry = NULL;
+	struct device *dev = &csi2->isys->adev->auxdev.dev;
+	struct v4l2_mbus_frame_desc desc;
+	struct v4l2_subdev *source;
+	struct media_pad *pad;
+	unsigned int i;
+	int ret;
+
+#ifdef CONFIG_VIDEO_INTEL_IPU6_ISYS_RESET
+	csi2->is_multiple = false;
+#endif
+	source = media_entity_to_v4l2_subdev(source_entity);
+	if (!source)
+		return -EPIPE;
+
+	pad = media_pad_remote_pad_first(&csi2->asd.pad[CSI2_PAD_SINK]);
+	if (!pad)
+		return -EPIPE;
+
+	ret = v4l2_subdev_call(source, pad, get_frame_desc, pad->index, &desc);
+	if (ret)
+		return ret;
+
+	if (desc.type != V4L2_MBUS_FRAME_DESC_TYPE_CSI2) {
+		dev_err(dev, "Unsupported frame descriptor type\n");
+		return -EINVAL;
+	}
+
+	for (i = 0; i < desc.num_entries; i++) {
+		if (source_stream == desc.entry[i].stream) {
+			desc_entry = &desc.entry[i];
+			break;
+		}
+	}
+
+	if (!desc_entry) {
+		dev_err(dev, "Failed to find stream %u from remote subdev\n",
+			source_stream);
+		return -EINVAL;
+	}
+
+	if (desc_entry->bus.csi2.vc >= NR_OF_CSI2_VC) {
+		dev_err(dev, "invalid vc %d\n", desc_entry->bus.csi2.vc);
+		return -EINVAL;
+	}
+
+	*entry = *desc_entry;
+
+	for (i = 0; i < desc.num_entries; i++) {
+		if (desc_entry->bus.csi2.vc == desc.entry[i].bus.csi2.vc)
+			(*nr_queues)++;
+	}
+
+#ifdef CONFIG_VIDEO_INTEL_IPU6_ISYS_RESET
+	csi2->is_multiple = true;
+	dev_dbg(dev, "set csi2->is_multiple is true.\n");
+#endif
+	return 0;
 }

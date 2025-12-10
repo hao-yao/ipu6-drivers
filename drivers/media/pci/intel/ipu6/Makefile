@@ -1,45 +1,25 @@
-# SPDX-License-Identifier: GPL-2.0
-# Copyright (c) 2017 - 2024 Intel Corporation.
+# SPDX-License-Identifier: GPL-2.0-only
 
-ifneq ($(EXTERNAL_BUILD), 1)
-srcpath := $(srctree)
-endif
+intel-ipu6-y			:= ipu6.o \
+				ipu6-bus.o \
+				ipu6-dma.o \
+				ipu6-mmu.o \
+				ipu6-buttress.o \
+				ipu6-cpd.o \
+				ipu6-fw-com.o \
+				ipu6-trace.o
 
-ccflags-y += -DIPU_HAS_S2M -DIPU_TPG_FRAME_SYNC \
-		-DIPU_ISYS_GPC -DI2C_DYNAMIC
-ccflags-y += -DIPU_ISYS_RESET
+obj-$(CONFIG_VIDEO_INTEL_IPU6)	+= intel-ipu6.o
 
-intel-ipu6-objs				+= ../ipu.o \
-					   ../ipu-bus.o \
-					   ../ipu-dma.o \
-					   ../ipu-mmu.o \
-					   ../ipu-buttress.o \
-					   ../ipu-trace.o \
-					   ../ipu-cpd.o \
-					   ipu6.o \
-					   ../ipu-fw-com.o
+intel-ipu6-isys-y		:= ipu6-isys.o \
+				ipu6-isys-csi2.o \
+				ipu6-fw-isys.o \
+				ipu6-isys-video.o \
+				ipu6-isys-queue.o \
+				ipu6-isys-subdev.o \
+				ipu6-isys-mcd-phy.o \
+				ipu6-isys-jsl-phy.o \
+				ipu6-isys-dwc-phy.o
 
-obj-$(CONFIG_VIDEO_INTEL_IPU6)		+= intel-ipu6.o
-
-intel-ipu6-isys-objs			+= ../ipu-isys.o \
-					   ../ipu-isys-csi2.o \
-					   ipu6-isys.o \
-					   ipu6-isys-phy.o \
-					   ipu6-isys-dwc-phy.o \
-					   ipu6-isys-csi2.o \
-					   ipu6-isys-gpc.o \
-					   ../ipu-isys-csi2-be-soc.o \
-					   ../ipu-fw-isys.o \
-					   ../ipu-isys-video.o \
-					   ../ipu-isys-queue.o \
-					   ../ipu-isys-subdev.o
-intel-ipu6-isys-objs			+= ../ipu-isys-csi2-be.o
-
-obj-$(CONFIG_VIDEO_INTEL_IPU6)		+= intel-ipu6-isys.o
-
-obj-$(CONFIG_VIDEO_INTEL_IPU6)		+= psys/
-
-ccflags-y += -I$(srcpath)/$(src)/../../../../../include/
-ccflags-y += -I$(srcpath)/$(src)/psys/
-ccflags-y += -I$(srcpath)/$(src)/../
-ccflags-y += -I$(srcpath)/$(src)/
+obj-$(CONFIG_VIDEO_INTEL_IPU6)	+= intel-ipu6-isys.o
+obj-$(CONFIG_VIDEO_INTEL_IPU6)  += psys/

@@ -24,4 +24,3 @@ ifeq ($(is_kernel_lt_6_10), 1)
 ccflags-y += -I$(src)/../ipu6/
 endif
 ccflags-y += -I$(src)/../
-ccflags-y += -I$(src)/../../

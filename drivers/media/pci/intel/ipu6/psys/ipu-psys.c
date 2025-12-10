@@ -1724,10 +1724,11 @@ static int psys_runtime_pm_suspend(struct device *dev)
 	if (!psys)
 		return 0;
 
-	if (!psys->ready)
-		return 0;
-
 	spin_lock_irqsave(&psys->ready_lock, flags);
+	if (!psys->ready) {
+		spin_unlock_irqrestore(&psys->ready_lock, flags);
+		return 0;
+	}
 	psys->ready = 0;
 	spin_unlock_irqrestore(&psys->ready_lock, flags);
 

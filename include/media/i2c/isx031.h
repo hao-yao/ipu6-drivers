@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright (C) 2014 - 2022 Intel Corporation */
+/* Copyright (C) 2014 - 2025 Intel Corporation */
 
 #ifndef __ISX031_H
 #define __ISX031_H
@@ -17,7 +17,7 @@ struct isx031_platform_data {
 	int irq_pin;
 	unsigned int irq_pin_flags;
 	char irq_pin_name[16];
-	char suffix;
+	char suffix[5];
 	int gpios[4];
 };
 

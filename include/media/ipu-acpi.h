@@ -16,10 +16,44 @@
 #ifndef MEDIA_INTEL_IPU_ACPI_H
 #define MEDIA_INTEL_IPU_ACPI_H
 
-#include <linux/version.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
 #include <media/ipu-isys.h>
 #include "ipu-isys.h"
+#else
+#include <linux/clkdev.h>
+#include <linux/i2c.h>
+
+#include <media/v4l2-mediabus.h>
+
+struct ipu_isys_csi2_config {
+	unsigned int nlanes;
+	unsigned int port;
+	enum v4l2_mbus_type bus_type;
+};
+
+struct ipu_isys_subdev_i2c_info {
+	struct i2c_board_info board_info;
+	int i2c_adapter_id;
+	char i2c_adapter_bdf[32];
+};
+
+struct ipu_isys_subdev_info {
+	struct ipu_isys_csi2_config *csi2;
+	struct ipu_isys_subdev_i2c_info i2c;
+#if IS_ENABLED(CONFIG_INTEL_IPU_ACPI)
+	char *acpi_hid;
+#endif
+};
+
+struct ipu_isys_clk_mapping {
+	struct clk_lookup clkdev_data;
+	char *platform_clock_name;
+};
+
+struct ipu_isys_subdev_pdata {
+	struct ipu_isys_subdev_info **subdevs;
+	struct ipu_isys_clk_mapping *clk_map;
+};
 #endif
 
 #define MAX_ACPI_SENSOR_NUM	4
@@ -30,6 +64,9 @@
 #define GPIO_POWER_EN		0xb
 #define GPIO_READY_STAT		0x13
 #define GPIO_HDMI_DETECT	0x14
+
+#define IPU_SPDATA_GPIO_NUM	4
+#define IPU_SPDATA_IRQ_PIN_NAME_LEN 16
 
 void set_built_in_pdata(struct ipu_isys_subdev_pdata *pdata);
 
@@ -72,7 +109,8 @@ struct sensor_bios_data_packed {
 	u8 pprval;
 	u8 pprunit;
 	u8 flashid;
-	u8 reserved2[8];
+	u8 phyconfig;
+	u8 reserved2[7];
 } __attribute__((__packed__));
 
 struct ipu_i2c_info {
@@ -98,6 +136,7 @@ struct sensor_bios_data {
 	u8 pprunit;
 	struct ipu_i2c_info i2c[MAX_ACPI_I2C_NUM];
 	u64 i2c_num;
+	u8 bus_type;
 };
 
 struct control_logic_data_packed {
@@ -142,19 +181,6 @@ struct control_logic_data {
 	bool completed;
 };
 
-int ipu_get_acpi_devices(void *driver_data,
-				struct device *dev,
-				struct ipu_isys_subdev_pdata **spdata,
-				struct ipu_isys_subdev_pdata **built_in_pdata,
-				int (*fn)
-				(struct device *, void *,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
-				 struct ipu_isys_csi2_config *csi2,
-#else
-				 struct ipu6_isys_csi2_config *csi2,
-#endif
-				 bool reprobe));
-
 struct ipu_isys_subdev_pdata *get_built_in_pdata(void);
 
 int ipu_acpi_get_cam_data(struct device *dev,
@@ -174,11 +200,7 @@ struct intel_ipu6_regulator {
 
 struct ipu_i2c_helper {
 	int (*fn)(struct device *dev, void *priv,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
 		struct ipu_isys_csi2_config *csi2,
-#else
-		struct ipu6_isys_csi2_config *csi2,
-#endif
 		bool reprobe);
 	void *driver_data;
 };
@@ -192,11 +214,7 @@ struct ipu_i2c_new_dev {
 struct ipu_camera_module_data {
 	struct list_head list;
 	struct ipu_isys_subdev_info sd;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
 	struct ipu_isys_csi2_config csi2;
-#else
-	struct ipu6_isys_csi2_config csi2;
-#endif
 	unsigned int ext_clk;
 	void *pdata; /* Ptr to generated platform data*/
 	void *priv; /* Private for specific subdevice */
