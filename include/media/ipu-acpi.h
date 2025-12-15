@@ -16,6 +16,7 @@
 #ifndef MEDIA_INTEL_IPU_ACPI_H
 #define MEDIA_INTEL_IPU_ACPI_H
 
+#include <linux/version.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
 #include <media/ipu-isys.h>
 #include "ipu-isys.h"
