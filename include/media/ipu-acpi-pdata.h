@@ -1,11 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /* Copyright (C) 2023-2025 Intel Corporation */
-
 #include <linux/interrupt.h>
 #include <media/ipu-acpi.h>
-#if IS_ENABLED(CONFIG_VIDEO_ISX031)
-#include <media/i2c/isx031.h>
-#endif
+#include <media/v4l2-mediabus.h>
+#include <media/serdes-pdata.h>
 
 #define CL_EMPTY 0
 #define CL_DISCRETE 1
@@ -13,6 +11,10 @@
 #define SERDES_MAX_PORT 4
 #define SERDES_MAX_GPIO_POWERUP_SEQ 4
 #define LOOP_SIZE 10
+
+/* CPHY is supported since ipu7*/
+#define PHY_MODE_DPHY  0
+#define PHY_MODE_CPHY  1
 
 int get_sensor_pdata(struct device *dev,
 			struct ipu_camera_module_data *data,
@@ -37,27 +39,6 @@ struct sensor_platform_data {
 	int detect_pin;
 	char suffix;
 	int gpios[IPU_SPDATA_GPIO_NUM];
-};
-
-struct serdes_platform_data {
-	unsigned int subdev_num;
-	struct serdes_subdev_info *subdev_info;
-	unsigned int reset_gpio;
-	unsigned int FPD_gpio;
-	char suffix;
-	unsigned int link_freq_mbps;
-	unsigned int deser_nlanes;
-	unsigned int ser_nlanes;
-	struct i2c_board_info *deser_board_info;
-};
-
-struct serdes_subdev_info {
-	struct i2c_board_info board_info;
-	int i2c_adapter_id;
-	unsigned short rx_port;
-	unsigned short phy_i2c_addr;
-	unsigned short ser_alias;
-	char suffix[5]; /* suffix for subdevs */
 };
 
 struct serdes_module_pdata {

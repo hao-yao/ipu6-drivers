@@ -12,17 +12,13 @@
  * GNU General Public License for more details.
  *
  */
-#include <linux/version.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
-#include "ipu6-isys.h"
-#endif
 #include <media/ipu-acpi.h>
 #include <media/ipu-acpi-pdata.h>
 
 #define MIN_SENSOR_I2C 1
 #define MIN_SERDES_I2C 3
 #define SENSOR_2X_I2C 5
-#define SUFFIX_BASE 96
+#define SUFFIX_BASE 97
 #define MSG_LEN 128
 
 static struct ipu_isys_subdev_pdata *ptr_built_in_pdata;
@@ -46,9 +42,67 @@ struct ipu_isys_subdev_pdata acpi_subdev_pdata = {
 
 struct serdes_local serdes_info;
 
+/*
+ * The dev_id was hard code in platform data, as i2c bus number
+ * may change dynamiclly, we need to update this bus id
+ * accordingly.
+ *
+ * @adapter_id: hardware i2c adapter id, this was fixed in platform data
+ * return: i2c bus id registered in system
+ */
+static int get_i2c_bus_id(int adapter_id, char *adapter_bdf, int bdf_len)
+{
+	struct i2c_adapter *adapter;
+	char name[32];
+	int i = 0;
+
+	if (adapter_bdf) {
+		while ((adapter = i2c_get_adapter(i)) != NULL) {
+			struct device *parent = adapter->dev.parent;
+			struct device *pp = parent->parent;
+
+			if (pp && !strncmp(adapter_bdf, dev_name(pp), bdf_len))
+				return i;
+			i++;
+		}
+	}
+
+	i = 0;
+	snprintf(name, sizeof(name), "i2c_designware.%d", adapter_id);
+	while ((adapter = i2c_get_adapter(i)) != NULL) {
+		struct device *parent = adapter->dev.parent;
+
+		if (parent && !strncmp(name, dev_name(parent), sizeof(name)))
+			return i;
+		i++;
+	}
+
+	/* Not found, should never happen! */
+	WARN_ON_ONCE(1);
+	return -1;
+}
+
+/*
+ * update i2c bus here to avoid deadlock between i2c_for_each_dev
+ * and i2c_get_adapter
+ */
+static void update_i2c_bus_id(void)
+{
+	struct ipu_isys_subdev_info **subdevs = acpi_subdev_pdata.subdevs;
+
+	for (int i = 0; subdevs[i] != NULL; i++) {
+		subdevs[i]->i2c.i2c_adapter_id =
+			get_i2c_bus_id(subdevs[i]->i2c.i2c_adapter_id,
+				       subdevs[i]->i2c.i2c_adapter_bdf,
+				       sizeof(subdevs[i]->i2c.i2c_adapter_bdf));
+	}
+}
+
 struct ipu_isys_subdev_pdata *get_acpi_subdev_pdata(void)
 {
 	struct ipu_isys_subdev_pdata *ptr;
+
+	update_i2c_bus_id();
 	ptr = &acpi_subdev_pdata;
 	return ptr;
 }
@@ -56,7 +110,7 @@ EXPORT_SYMBOL(get_acpi_subdev_pdata);
 
 static void print_serdes_sdinfo(struct serdes_subdev_info *sdinfo)
 {
-	int j;
+	int i;
 	struct serdes_module_pdata *sd_mpdata = sdinfo->board_info.platform_data;
 
 	if (!sd_mpdata) {
@@ -67,6 +121,7 @@ static void print_serdes_sdinfo(struct serdes_subdev_info *sdinfo)
 	pr_debug("\t\trx_port \t\t= %d", sdinfo->rx_port);
 	pr_debug("\t\tphy_i2c_addr \t\t= 0x%x", sdinfo->phy_i2c_addr);
 	pr_debug("\t\tser_alias \t\t= 0x%x", sdinfo->ser_alias);
+	pr_debug("\t\tser_phys_addr \t\t= 0x%x", sdinfo->ser_phys_addr);
 	pr_debug("\t\tsuffix \t\t\t= %s", sdinfo->suffix);
 	pr_debug("\t\tboard_info.type \t= %s", sdinfo->board_info.type);
 	pr_debug("\t\tboard_info.addr \t= 0x%x", sdinfo->board_info.addr);
@@ -77,9 +132,9 @@ static void print_serdes_sdinfo(struct serdes_subdev_info *sdinfo)
 	pr_debug("\t\tfsin \t\t\t= %d", sd_mpdata->fsin);
 
 	if (serdes_info.gpio_powerup_seq > 0)
-		for (j = 0; j < serdes_info.gpio_powerup_seq; j++)
-			pr_debug("\t\t gpio_powerup_seq[%d] \t= %d", j,
-				(int)sd_mpdata->gpio_powerup_seq[j]);
+		for (i = 0; i < serdes_info.gpio_powerup_seq; i++)
+			pr_debug("\t\t gpio_powerup_seq[%d] \t= %d", i,
+				(int)sd_mpdata->gpio_powerup_seq[i]);
 }
 
 static void print_serdes_subdev(struct ipu_isys_subdev_info *sd)
@@ -94,10 +149,11 @@ static void print_serdes_subdev(struct ipu_isys_subdev_info *sd)
 		return;
 	}
 
-	pr_debug("IPU6 ACPI: %s", __func__);
+	pr_debug("IPU ACPI: %s", __func__);
 	pr_debug("sd_csi2");
 	pr_debug("\t\tnlanes \t\t\t= %d", sd->csi2->nlanes);
 	pr_debug("\t\tport \t\t\t= %d", sd->csi2->port);
+	pr_debug("\t\ttype \t\t\t= %d", sd->csi2->bus_type);
 
 	pr_debug("sd->i2c");
 	pr_debug("\t\ti2c_adapter_bdf \t= %s", sd->i2c.i2c_adapter_bdf);
@@ -112,6 +168,7 @@ static void print_serdes_subdev(struct ipu_isys_subdev_info *sd)
 	pr_debug("\t\tlink_freq_mbps \t\t= %d", sd_pdata->link_freq_mbps);
 	pr_debug("\t\tdeser_nlanes \t\t= %d", sd_pdata->deser_nlanes);
 	pr_debug("\t\tser_nlanes \t\t= %d", sd_pdata->ser_nlanes);
+	pr_debug("\t\tser_name \t\t= %s", sd_pdata->ser_name);
 
 	for (i = 0; i < serdes_info.rx_port; i++) {
 		sd_sdinfo = &sd_pdata->subdev_info[i];
@@ -132,14 +189,15 @@ static void print_subdev(struct ipu_isys_subdev_info *sd)
 	int i;
 
 	if (!spdata) {
-		pr_err("IPU6 ACPI: Empty sensor subdev");
+		pr_err("IPU ACPI: Empty sensor subdev");
 		return;
 	}
 
-	pr_debug("IPU6 ACPI: %s", __func__);
+	pr_debug("IPU ACPI: %s", __func__);
 	pr_debug("sd->csi2");
 	pr_debug("\t\tnlanes \t\t\t= %d", sd->csi2->nlanes);
 	pr_debug("\t\tport \t\t\t= %d", sd->csi2->port);
+	pr_debug("\t\ttype \t\t\t= %d", sd->csi2->bus_type);
 
 	pr_debug("sd->i2c");
 	pr_debug("\t\ti2c_adapter_bdf \t= %s", sd->i2c.i2c_adapter_bdf);
@@ -462,9 +520,8 @@ static void update_pdata(struct device *dev,
 	}
 
 	/* update total num of sensor connected */
-	if (connect == TYPE_SERDES) {
+	if (connect == TYPE_SERDES)
 		serdes_info.deser_num++;
-	}
 }
 
 static void set_common_gpio(struct control_logic_data *ctl_data,
@@ -487,19 +544,15 @@ static void set_common_gpio(struct control_logic_data *ctl_data,
 		for (i = 0; i < ctl_data->gpio_num; i++)
 			if (ctl_data->gpio[i].func != GPIO_RESET)
 				dev_err(ctl_data->dev,
-					"IPU6 ACPI: Invalid GPIO func: %d\n",
+					"IPU ACPI: Invalid GPIO func: %d\n",
 					ctl_data->gpio[i].func);
 }
 
 static int set_csi2(struct ipu_isys_subdev_info **sensor_sd,
-		unsigned int lanes,
-		unsigned int port)
+		    unsigned int lanes, unsigned int port,
+		    unsigned int bus_type)
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
 	struct ipu_isys_csi2_config *csi2_config;
-#else
-	struct ipu6_isys_csi2_config *csi2_config;
-#endif
 
 	csi2_config = kzalloc(sizeof(*csi2_config), GFP_KERNEL);
 	if (!csi2_config)
@@ -507,6 +560,13 @@ static int set_csi2(struct ipu_isys_subdev_info **sensor_sd,
 
 	csi2_config->nlanes = lanes;
 	csi2_config->port = port;
+	if (bus_type == PHY_MODE_DPHY)
+		csi2_config->bus_type = V4L2_MBUS_CSI2_DPHY;
+	else if (bus_type == PHY_MODE_CPHY)
+		csi2_config->bus_type = V4L2_MBUS_CSI2_CPHY;
+	else
+		csi2_config->bus_type = V4L2_MBUS_UNKNOWN;
+
 	(*sensor_sd)->csi2 = csi2_config;
 
 	return 0;
@@ -518,7 +578,7 @@ static void set_i2c(struct ipu_isys_subdev_info **sensor_sd,
 		unsigned int addr,
 		const char *i2c_adapter_bdf)
 {
-	dev_info(dev, "IPU6 ACPI: kernel I2C BDF: %s", i2c_adapter_bdf);
+	dev_info(dev, "IPU ACPI: kernel I2C BDF: %s", i2c_adapter_bdf);
 	(*sensor_sd)->i2c.board_info.addr = addr;
 	strscpy((*sensor_sd)->i2c.board_info.type, sensor_name, I2C_NAME_SIZE);
 	strscpy((*sensor_sd)->i2c.i2c_adapter_bdf, i2c_adapter_bdf,
@@ -549,7 +609,7 @@ static int set_serdes_subdev(struct ipu_isys_subdev_info **serdes_sd,
 	struct serdes_module_pdata *module_pdata[PORT_NR];
 	struct serdes_subdev_info *serdes_sdinfo;
 	size_t subdev_size = subdev_num * sizeof(*serdes_sdinfo);
-	unsigned int port = (*pdata)->suffix - SUFFIX_BASE - 1;
+	unsigned int port = (*pdata)->suffix - SUFFIX_BASE;
 
 	serdes_sdinfo = kzalloc(subdev_size, GFP_KERNEL);
 	if (!serdes_sdinfo)
@@ -576,7 +636,11 @@ static int set_serdes_subdev(struct ipu_isys_subdev_info **serdes_sd,
 
 		serdes_sdinfo[i].phy_i2c_addr = serdes_info.phy_i2c_addr;
 		snprintf(serdes_sdinfo[i].suffix, sizeof(serdes_sdinfo[i].suffix), "%c-%d",
-			 SUFFIX_BASE + i + 1, port);
+			 SUFFIX_BASE + i, port);
+#if IS_ENABLED(CONFIG_VIDEO_ISX031)
+		serdes_sdinfo[i].ser_phys_addr = 0x40;
+		serdes_sdinfo[i].sensor_dt = 0x1e;
+#endif
 	}
 
 	(*pdata)->subdev_info = serdes_sdinfo;
@@ -597,7 +661,8 @@ static int set_pdata(struct ipu_isys_subdev_info **sensor_sd,
 		unsigned int deser_lanes,
 		bool is_dummy,
 		enum connection_type connect,
-		u32 link_freq)
+		int link_freq,
+		int des_port)
 {
 	if (connect == TYPE_DIRECT) {
 		struct sensor_platform_data *pdata;
@@ -606,12 +671,12 @@ static int set_pdata(struct ipu_isys_subdev_info **sensor_sd,
 		if (!pdata)
 			return -ENOMEM;
 
-		pr_debug("IPU6 ACPI: %s - Direct connection", __func__);
+		pr_debug("IPU ACPI: %s - Direct connection", __func__);
 		/* use ascii */
 		/* port for start from 0 */
 		if (port >= 0) {
-			pdata->suffix = port + SUFFIX_BASE + 1;
-			pr_info("IPU6 ACPI: create %s on port %d",
+			pdata->suffix = port + SUFFIX_BASE;
+			pr_info("IPU ACPI: create %s on port %d",
 				sensor_name, port);
 		} else
 			dev_err(dev, "INVALID MIPI PORT");
@@ -631,19 +696,21 @@ static int set_pdata(struct ipu_isys_subdev_info **sensor_sd,
 		if (!pdata)
 			return -ENOMEM;
 
-		pr_debug("IPU6 ACPI: %s - Serdes connection", __func__);
-
+		pr_debug("IPU ACPI: %s - Serdes connection", __func__);
 		/* use ascii */
 		if (port >= 0) {
-			pdata->suffix = port + SUFFIX_BASE + 1;
-			pr_info("IPU6 ACPI: create %s on mipi port %d",
+			pdata->suffix = port + SUFFIX_BASE;
+			pr_info("IPU ACPI: create %s on mipi port %d",
 				sensor_name, port);
 		} else
-			pr_err("IPU6 ACPI: Invalid MIPI Port : %d", port);
+			pr_err("IPU ACPI: Invalid MIPI Port : %d", port);
 
 		pdata->link_freq_mbps = link_freq;
+		pdata->bus_type = (*sensor_sd)->csi2->bus_type;
 		pdata->deser_nlanes = deser_lanes;
 		pdata->ser_nlanes = lanes;
+		pdata->des_port = des_port;
+		strscpy(pdata->ser_name, (*sensor_sd)->i2c.board_info.type, I2C_NAME_SIZE);
 		set_serdes_subdev(sensor_sd, dev, &pdata, sensor_name, hid_name, lanes, addr, subdev_num);
 
 		(*sensor_sd)->i2c.board_info.platform_data = pdata;
@@ -693,47 +760,47 @@ static int populate_sensor_pdata(struct device *dev,
 
 	if (connect == TYPE_DIRECT) {
 		/* sensor csi2 info */
-		ret = set_csi2(sensor_sd, cam_data->lanes, cam_data->link);
+		ret = set_csi2(sensor_sd, cam_data->lanes, cam_data->link, cam_data->bus_type);
 		if (ret)
 			return ret;
 
 		/* sensor i2c info */
 		if (cam_data->i2c_num == MIN_SENSOR_I2C) {
-			pr_debug("IPU6 ACPI: num of I2C device for Direct connection: %lld is Correct.",
+			pr_debug("IPU ACPI: num of I2C device for Direct connection: %lld is Correct.",
 				cam_data->i2c_num);
 			set_i2c(sensor_sd, dev, sensor_name, cam_data->i2c[0].addr, cam_data->i2c[0].bdf);
 		} else {
-			pr_err("IPU6 ACPI: num of I2C device for Direct connection : %lld is Incorrect",
+			pr_err("IPU ACPI: num of I2C device for Direct connection : %lld is Incorrect",
 				cam_data->i2c_num);
 			return -1;
 		}
 
 		if (ctl_data->type != CL_DISCRETE) {
-			dev_err(dev, "IPU6 ACPI: Control Logic Type\n");
+			dev_err(dev, "IPU ACPI: Control Logic Type\n");
 			dev_err(dev, "for %s: %d is Incorrect\n",
 				sensor_name, ctl_data->type);
 			return -EINVAL;
 		}
 	} else if (connect == TYPE_SERDES) {
 		/* serdes csi2 info. pprval as deserializer lane */
-		ret = set_csi2(sensor_sd, cam_data->pprval, cam_data->link);
+		ret = set_csi2(sensor_sd, cam_data->pprval, cam_data->link, cam_data->bus_type);
 		if (ret)
 			return ret;
 
 		/* Use DISCRETE Control Logic or No Control Logic for serdes */
 		if (ctl_data->type != CL_DISCRETE && ctl_data->type != CL_EMPTY) {
-			pr_err("IPU6 ACPI: Control Logic Type for serdes: %d is Incorrect",
+			pr_err("IPU ACPI: Control Logic Type for serdes: %d is Incorrect",
 				ctl_data->type);
 			return -1;
 		}
 
 		/* serdes i2c info */
 		if (cam_data->i2c_num >= MIN_SERDES_I2C) {
-			pr_debug("IPU6 ACPI: num of I2C device for Serdes connection: %lld is Correct",
+			pr_debug("IPU ACPI: num of I2C device for Serdes connection: %lld is Correct",
 				cam_data->i2c_num);
 			set_i2c(sensor_sd, dev, serdes_name, cam_data->i2c[0].addr, cam_data->i2c[0].bdf);
 		} else {
-			pr_err("IPU6 ACPI: num of I2C device for Serdes connection: %lld is Incorrect",
+			pr_err("IPU ACPI: num of I2C device for Serdes connection: %lld is Incorrect",
 				cam_data->i2c_num);
 			return -1;
 		}
@@ -745,7 +812,7 @@ static int populate_sensor_pdata(struct device *dev,
 	/* Use last I2C device */
 	ret = set_pdata(sensor_sd, dev, sensor_name, hid_name, ctl_data, cam_data->link,
 		cam_data->lanes, cam_data->i2c[cam_data->i2c_num - 1].addr,
-		cam_data->pprunit, cam_data->pprval, false, connect, link_freq);
+		cam_data->pprunit, cam_data->pprval, false, connect, link_freq, cam_data->degree);
 	if (ret)
 		return ret;
 
@@ -828,4 +895,4 @@ EXPORT_SYMBOL(get_sensor_pdata);
 
 MODULE_AUTHOR("Khai Wen, Ng <khai.wen.ng@intel.com>");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("IPU6 ACPI support");
+MODULE_DESCRIPTION("IPU ACPI support");

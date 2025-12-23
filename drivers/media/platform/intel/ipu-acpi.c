@@ -32,22 +32,10 @@
 #include <linux/clkdev.h>
 #include <linux/kernel.h>
 #include <linux/pci.h>
-#include <linux/version.h>
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
-#include <media/ipu-isys.h>
-#include "ipu.h"
-#else
-#include "ipu6-isys.h"
-#include "ipu6.h"
-#endif
 
 #include <media/ipu-acpi-pdata.h>
 #include <media/ipu-acpi.h>
-
-#if IS_ENABLED(CONFIG_VIDEO_ISX031)
-#include <media/i2c/isx031.h>
-#endif
+#include <media/ipu-get-acpi.h>
 
 static LIST_HEAD(devices);
 
@@ -69,9 +57,10 @@ static const struct ipu_acpi_devices supported_devices[] = {
  *	{ "ACPI ID", sensor_name, get_sensor_pdata, NULL, 0, TYPE, serdes_name,
  *		sensor_physical_addr, link_freq(mbps) },	// Custom HID
  */
+
 #if IS_ENABLED(CONFIG_VIDEO_MAX9X)
 #if IS_ENABLED(CONFIG_VIDEO_ISX031)
-	{ "INTC031M", ISX031_NAME, get_sensor_pdata, NULL, 0, TYPE_SERDES, "max9296",
+	{ "INTC031M", ISX031_NAME, get_sensor_pdata, NULL, 0, TYPE_SERDES, "max9x",
 		ISX031_I2C_ADDRESS, 1600 },	// D3 ISX031 HID
 #endif
 #endif
@@ -79,7 +68,8 @@ static const struct ipu_acpi_devices supported_devices[] = {
 
 static int get_table_index(const char *acpi_name)
 {
-	unsigned int i;
+	int i;
+
 	for (i = 0; i < ARRAY_SIZE(supported_devices); i++) {
 		if (!strncmp(supported_devices[i].hid_name, acpi_name,
 			     strlen(supported_devices[i].hid_name)))
@@ -116,7 +106,7 @@ static int ipu_acpi_get_pdata(struct device *dev, int index)
 	if (!camdata)
 		return -ENOMEM;
 
-	pr_info("IPU6 ACPI: Getting BIOS data for %s (%s)",
+	pr_info("IPU ACPI: Getting BIOS data for %s (%s)",
 		supported_devices[index].real_driver, dev_name(dev));
 
 	rval = supported_devices[index].get_platform_data(
@@ -148,8 +138,8 @@ static int ipu_acpi_test(struct device *dev, void *priv)
 
 	if (acpi_idx < 0)
 		return 0;
-	else
-		dev_info(dev, "IPU6 ACPI: ACPI device %s\n", dev_name(dev));
+
+	dev_info(dev, "IPU6 ACPI: ACPI device %s\n", dev_name(dev));
 
 	const char *target_hid = supported_devices[acpi_idx].hid_name;
 
@@ -166,10 +156,10 @@ static int ipu_acpi_test(struct device *dev, void *priv)
 		if (!adev) {
 			dev_dbg(dev, "No ACPI device found for %s\n", target_hid);
 			return 0;
-		} else {
-			set_primary_fwnode(dev, &adev->fwnode);
-			dev_dbg(dev, "Assigned fwnode to %s\n", dev_name(dev));
 		}
+
+		set_primary_fwnode(dev, &adev->fwnode);
+		dev_dbg(dev, "Assigned fwnode to %s\n", dev_name(dev));
 	}
 
 	if (ACPI_COMPANION(dev) != adev) {
@@ -199,15 +189,11 @@ static int ipu_acpi_test(struct device *dev, void *priv)
 
 int ipu_get_acpi_devices(void *driver_data,
 				struct device *dev,
-				struct ipu_isys_subdev_pdata **spdata,
-				struct ipu_isys_subdev_pdata **built_in_pdata,
+				void **spdata,
+				void **built_in_pdata,
 				int (*fn)
 				(struct device *, void *,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
-				 struct ipu_isys_csi2_config *csi2,
-#else
-				 struct ipu6_isys_csi2_config *csi2,
-#endif
+				 void *csi2,
 				 bool reprobe))
 {
 	int rval;
@@ -236,6 +222,23 @@ int ipu_get_acpi_devices(void *driver_data,
 }
 EXPORT_SYMBOL(ipu_get_acpi_devices);
 
+int ipu_get_acpi_devices_new(void **spdata)
+{
+	int rval;
+	struct ipu_isys_subdev_pdata *ptr = NULL;
+
+	rval = acpi_bus_for_each_dev(ipu_acpi_test, NULL);
+	if (rval < 0)
+		return rval;
+
+	ptr = get_acpi_subdev_pdata();
+	if (ptr && *ptr->subdevs)
+		*spdata = ptr;
+
+	return 0;
+}
+EXPORT_SYMBOL(ipu_get_acpi_devices_new);
+
 static int __init ipu_acpi_init(void)
 {
 	set_built_in_pdata(NULL);
@@ -251,4 +254,4 @@ module_exit(ipu_acpi_exit);
 
 MODULE_AUTHOR("Samu Onkalo <samu.onkalo@intel.com>");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("IPU6 ACPI support");
+MODULE_DESCRIPTION("IPU ACPI support");
