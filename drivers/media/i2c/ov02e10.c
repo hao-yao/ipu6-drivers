@@ -56,6 +56,7 @@ static const struct acpi_device_id cvfd_ids[] = {
 
 /* vertical-timings from sensor */
 #define OV02E10_REG_VTS                  0x35
+#define OV02E10_REG_DUMMY_LINE           0x05
 #define OV02E10_VTS_DEF                  2244
 #define OV02E10_VTS_MIN                  2244
 #define OV02E10_VTS_MAX                  0x7fff
@@ -65,8 +66,8 @@ static const struct acpi_device_id cvfd_ids[] = {
 
 /* Exposure controls from sensor */
 #define OV02E10_REG_EXPOSURE             0x03
-#define OV02E10_EXPOSURE_MIN             1
-#define OV02E10_EXPOSURE_MAX_MARGIN      2
+#define OV02E10_EXPOSURE_MIN             2
+#define OV02E10_EXPOSURE_MAX_MARGIN      33
 #define OV02E10_EXPOSURE_STEP            1
 
 /* Analog gain controls from sensor */
@@ -77,15 +78,14 @@ static const struct acpi_device_id cvfd_ids[] = {
 
 /* Digital gain controls from sensor */
 #define OV02E10_REG_DIGITAL_GAIN         0x21
-#define OV02E10_DGTL_GAIN_MIN            256
-#define OV02E10_DGTL_GAIN_MAX            1020
+#define OV02E10_DGTL_GAIN_MIN            0x40
+#define OV02E10_DGTL_GAIN_MAX            0x7ff
 #define OV02E10_DGTL_GAIN_STEP           1
-#define OV02E10_DGTL_GAIN_DEFAULT        256
+#define OV02E10_DGTL_GAIN_DEFAULT        0x40
 
 /* Register update control */
-#define OV02E10_REG_COMMAND_UPDATE       0xE7
-#define OV02E10_COMMAND_UPDATE           0x00
-#define OV02E10_COMMAND_HOLD             0x01
+#define OV02E10_REG_COMMAND_UPDATE       0x01
+#define OV02E10_COMMAND_UPDATE           0x01
 
 /* Test Pattern Control */
 #define OV02E10_REG_TEST_PATTERN         0x12
@@ -163,7 +163,7 @@ static const struct ov02e10_reg mode_1928x1088_30fps_2lane[] = {
 	{ 0x20, 0x0b },
 	{ 0x21, 0x02 },
 	{ 0x10, 0x23 },
-	{ 0xc5, 0x04 },
+	{ 0xc5, 0x34 },
 	{ 0x21, 0x00 },
 	{ 0x14, 0x96 },
 	{ 0x17, 0x01 },
@@ -171,82 +171,104 @@ static const struct ov02e10_reg mode_1928x1088_30fps_2lane[] = {
 	{ 0x03, 0x00 },
 	{ 0x04, 0x04 },
 	{ 0x05, 0x04 },
-	{ 0x06, 0x62 },
+	{ 0x06, 0x63 },
 	{ 0x07, 0x01 },
-	{ 0x22, 0x80 },
 	{ 0x24, 0xff },
 	{ 0x40, 0xc6 },
 	{ 0x41, 0x18 },
+	{ 0x42, 0xf5 },
 	{ 0x45, 0x3f },
 	{ 0x48, 0x0c },
 	{ 0x4c, 0x08 },
 	{ 0x51, 0x12 },
 	{ 0x52, 0x10 },
-	{ 0x57, 0x98 },
+	{ 0x57, 0xb0 },
 	{ 0x59, 0x06 },
 	{ 0x5a, 0x04 },
-	{ 0x5c, 0x38 },
+	{ 0x5c, 0x35 },
 	{ 0x5e, 0x10 },
 	{ 0x67, 0x11 },
-	{ 0x7b, 0x04 },
+	{ 0x76, 0x14 },
+	{ 0x7b, 0x0d },
 	{ 0x81, 0x12 },
 	{ 0x90, 0x51 },
 	{ 0x91, 0x09 },
-	{ 0x92, 0x21 },
-	{ 0x93, 0x28 },
-	{ 0x95, 0x54 },
-	{ 0x9d, 0x20 },
+	{ 0x92, 0x1e },
+	{ 0x93, 0x24 },
+	{ 0x95, 0x52 },
+	{ 0x9d, 0x1c },
 	{ 0x9e, 0x04 },
-	{ 0xb1, 0x9a },
-	{ 0xb2, 0x86 },
+	{ 0xa8, 0x01 },
+	{ 0xa9, 0x01 },
+	{ 0xab, 0x01 },
+	{ 0xac, 0x01 },
+	{ 0xb1, 0xbb },
+	{ 0xb2, 0xb8 },
 	{ 0xb6, 0x3f },
 	{ 0xb9, 0x30 },
 	{ 0xc1, 0x01 },
-	{ 0xc5, 0xa0 },
-	{ 0xc6, 0x73 },
+	{ 0xc3, 0x10 },
+	{ 0xc5, 0xe0 },
+	{ 0xc6, 0x7a },
 	{ 0xc7, 0x04 },
 	{ 0xc8, 0x25 },
 	{ 0xc9, 0x05 },
-	{ 0xca, 0x28 },
-	{ 0xcb, 0x00 },
+	{ 0xca, 0x25 },
 	{ 0xcf, 0x16 },
 	{ 0xd2, 0xd0 },
-	{ 0xd7, 0x3f },
-	{ 0xd8, 0x40 },
+	{ 0xd7, 0x3e },
+	{ 0xd8, 0x42 },
 	{ 0xd9, 0x40 },
-	{ 0xda, 0x44 },
+	{ 0xda, 0x46 },
 	{ 0xdb, 0x3d },
 	{ 0xdc, 0x3d },
 	{ 0xdd, 0x3d },
-	{ 0xde, 0x3d },
+	{ 0xde, 0x38 },
 	{ 0xdf, 0xf0 },
+	{ 0xe4, 0x00 },
+	{ 0xe5, 0x00 },
 	{ 0xea, 0x0f },
 	{ 0xeb, 0x04 },
 	{ 0xec, 0x29 },
-	{ 0xee, 0x47 },
+	{ 0xee, 0x46 },
 	{ 0xfd, 0x01 },
 	{ 0x31, 0x01 },
 	{ 0x27, 0x00 },
 	{ 0x2f, 0x41 },
 	{ 0xfd, 0x02 },
 	{ 0xa1, 0x01 },
-	{ 0xfd, 0x02 },
 	{ 0x9a, 0x03 },
 	{ 0xfd, 0x03 },
 	{ 0x9d, 0x0f },
+	{ 0xfd, 0x04 },
+	{ 0x19, 0x30 },
 	{ 0xfd, 0x07 },
 	{ 0x42, 0x00 },
-	{ 0x43, 0xad },
+	{ 0x43, 0xb0 },
 	{ 0x44, 0x00 },
-	{ 0x45, 0xa8 },
+	{ 0x45, 0xb0 },
 	{ 0x46, 0x00 },
-	{ 0x47, 0xa8 },
+	{ 0x47, 0xb0 },
 	{ 0x48, 0x00 },
-	{ 0x49, 0xad },
+	{ 0x49, 0xb0 },
 	{ 0xfd, 0x00 },
+	{ 0xa1, 0x05 },
+	{ 0x94, 0x0c },
+	{ 0x95, 0x07 },
+	{ 0x96, 0x12 },
+	{ 0x98, 0x08 },
+	{ 0x99, 0x0c },
+	{ 0x9a, 0x07 },
+	{ 0x9b, 0x08 },
+	{ 0x9c, 0x35 },
+	{ 0xa4, 0x35 },
+	{ 0xa5, 0x82 },
+	{ 0xa6, 0x68 },
 	{ 0xc4, 0x01 },
+	{ 0xa0, 0x00 },
 	{ 0xfd, 0x01 },
 	{ 0x33, 0x03 },
+	{ 0x01, 0x02 },
 	{ 0xfd, 0x00 },
 	{ 0x20, 0x1f },
 };
@@ -430,13 +452,16 @@ static int ov02e10_set_ctrl(struct v4l2_ctrl *ctrl)
 					       struct ov02e10, ctrl_handler);
 	struct i2c_client *client = v4l2_get_subdevdata(&ov02e10->sd);
 	s64 exposure_max;
+	u32 vts;
 	int ret;
 
 	/* Propagate change of current control to all related controls */
 	if (ctrl->id == V4L2_CID_VBLANK) {
 		/* Update max exposure while meeting expected vblanking */
-		exposure_max = ov02e10->cur_mode->height + ctrl->val -
-		    OV02E10_EXPOSURE_MAX_MARGIN;
+		ov02e10_write_reg(ov02e10, OV02E10_REG_PAGE_FLAG, 1,
+                                        OV02E10_PAGE_1);
+		ret = ov02e10_read_reg(ov02e10, OV02E10_REG_VTS, 2, &vts);
+		exposure_max = vts - OV02E10_EXPOSURE_MAX_MARGIN ; 
 		__v4l2_ctrl_modify_range(ov02e10->exposure,
 					 ov02e10->exposure->minimum,
 					 exposure_max, ov02e10->exposure->step,
@@ -446,8 +471,6 @@ static int ov02e10_set_ctrl(struct v4l2_ctrl *ctrl)
 	/* V4L2 controls values will be applied only when power is already up */
 	if (!pm_runtime_get_if_in_use(&client->dev))
 		return 0;
-	ret = ov02e10_write_reg(ov02e10, OV02E10_REG_COMMAND_UPDATE, 1,
-				OV02E10_COMMAND_HOLD);
 
 	switch (ctrl->id) {
 	case V4L2_CID_ANALOGUE_GAIN:
@@ -479,8 +502,9 @@ static int ov02e10_set_ctrl(struct v4l2_ctrl *ctrl)
 		dev_dbg(&client->dev, "set vblank\n");
 		ret = ov02e10_write_reg(ov02e10, OV02E10_REG_PAGE_FLAG, 1,
 					OV02E10_PAGE_1);
-		ret = ov02e10_write_reg(ov02e10, OV02E10_REG_VTS, 2,
-					ov02e10->cur_mode->height + ctrl->val);
+		ret = ov02e10_write_reg(ov02e10, OV02E10_REG_DUMMY_LINE, 2,
+					ctrl->val);
+
 		break;
 
 	case V4L2_CID_TEST_PATTERN:
@@ -502,9 +526,8 @@ static int ov02e10_set_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	}
 	dev_dbg(&client->dev, "will update cmd\n");
-	ret |= ov02e10_write_reg(ov02e10, OV02E10_REG_COMMAND_UPDATE, 1,
-				 OV02E10_COMMAND_UPDATE);
-
+	ret = ov02e10_write_reg(ov02e10, OV02E10_REG_COMMAND_UPDATE, 1,
+				OV02E10_COMMAND_UPDATE);
 	pm_runtime_put(&client->dev);
 
 	return ret;
@@ -1237,5 +1260,6 @@ static struct i2c_driver ov02e10_i2c_driver = {
 module_i2c_driver(ov02e10_i2c_driver);
 
 MODULE_AUTHOR("Jingjing Xiong <jingjing.xiong@intel.com>");
+MODULE_AUTHOR("Jimmy Su <jimmy.su@intel.com>");
 MODULE_DESCRIPTION("OmniVision OV02E10 sensor driver");
 MODULE_LICENSE("GPL v2");
